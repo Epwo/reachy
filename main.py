@@ -13,15 +13,23 @@ def on_face(face):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="buffalo_l",
-                        choices=["buffalo_sc", "buffalo_s", "buffalo_l"],
-                        help="InsightFace model pack (default: buffalo_l, best quality)")
-    parser.add_argument("--det-size", type=int, default=640,
-                        help="Detection input size (square). 640 is default.")
+    parser.add_argument(
+        "--model",
+        default="buffalo_l",
+        choices=["buffalo_sc", "buffalo_s", "buffalo_l"],
+        help="InsightFace model pack (default: buffalo_l, best quality)",
+    )
+    parser.add_argument(
+        "--det-size",
+        type=int,
+        default=640,
+        help="Detection input size (square). 640 is default.",
+    )
     args = parser.parse_args()
 
-    tracker = FaceTracker(det_size=(args.det_size, args.det_size),
-                          model_name=args.model)
+    tracker = FaceTracker(
+        det_size=(args.det_size, args.det_size), model_name=args.model
+    )
 
     # Auto-load tuning saved by experiment.py (S key). Falls back to defaults
     # if tracking_params.json doesn't exist.
