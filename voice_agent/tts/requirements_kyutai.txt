@@ -1,0 +1,17 @@
+# Voice agent — STEP 2 venv (Kyutai TTS)
+# Install with:  uv venv .venv_tts && source .venv_tts/bin/activate && uv pip install -r requirements_tts.txt
+#
+# Uses moshi_mlx with kyutai/tts-1.6b-en_fr. Pinned to older mlx (<0.27)
+# which is incompatible with mlx-vlm's pin — Step 1 lives in its own venv.
+
+moshi_mlx>=0.3.0           # Kyutai TTS 1.6B (expressive, slow on M4 base)
+sentencepiece
+
+# NOTE: Kokoro-82M lives in a separate venv (.venv_kokoro) — see
+# requirements_kokoro.txt. The two TTS engines can't share an env because
+# mlx-audio needs mlx>=0.31 while moshi_mlx pins mlx<0.27.
+
+# Shared
+numpy
+soundfile
+sounddevice

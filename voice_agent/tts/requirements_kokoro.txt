@@ -1,0 +1,11 @@
+# Kokoro-82M TTS via mlx-audio — runs in its own venv (.venv_kokoro).
+# Lives apart because mlx-audio>=0.4 needs mlx>=0.31, but moshi_mlx (Kyutai)
+# pins mlx<0.27 in .venv_tts. Two venvs sidestep the conflict.
+mlx-audio>=0.4
+misaki
+phonemizer-fork          # needed for non-English Kokoro pipelines
+espeakng-loader          # ships libespeak-ng so no Homebrew install needed
+
+numpy
+soundfile
+sounddevice

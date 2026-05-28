@@ -1,0 +1,13 @@
+# Voice agent — STEP 1 venv (audio understanding)
+# Install with:  uv venv .venv_lm && source .venv_lm/bin/activate && uv pip install -r requirements_lm.txt
+#
+# Uses Gemma 4 E4B (audio + text in -> text out) via mlx-vlm. Newer mlx
+# is required, which is incompatible with the moshi_mlx pin used by
+# the Kyutai TTS step — they live in separate environments.
+
+mlx-vlm>=0.4.4
+
+# Audio I/O + helpers shared with the test script
+numpy
+soundfile
+sounddevice
