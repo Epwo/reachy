@@ -41,7 +41,7 @@ def split_heard_and_reply(text: str) -> tuple[str, str]:
     return heard, reply or "(pas de réponse)"
 
 
-DEFAULT_MODEL = "mlx-community/gemma-4-e4b-it-4bit"
+DEFAULT_MODEL = "mlx-community/gemma-4-E4B-it-qat-4bit"
 # Smaller alternative if E4B is too slow:
 #   "mlx-community/gemma-4-e2b-it-4bit"  (~3 GB, lighter)
 # Older mobile-first family with mature MLX support:
