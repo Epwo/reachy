@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>Reachy Voice Agent</title>
+<style>
+  :root {
+    --bg: #14181f;
+    --panel: #1d232c;
+    --line: #2a323d;
+    --text: #e1e7ef;
+    --dim: #8c98a8;
+    --accent: #7fc1ff;
+    --good: #6bdb6b;
+    --warn: #ffb84a;
+    --hot: #ff6b6b;
+  }
+  body { background: var(--bg); color: var(--text); margin: 0;
+         font: 14px/1.4 ui-sans-serif, -apple-system, system-ui, sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 12px 18px;
+           border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .pill { font-size: 11px; padding: 3px 8px; border-radius: 10px;
+          background: #2c3440; color: var(--dim); }
+  .pill.idle      { background: #2c3440; color: var(--dim); }
+  .pill.listening { background: rgba(127,193,255,0.15); color: var(--accent); }
+  .pill.thinking  { background: rgba(255,184,74,0.15); color: var(--warn); }
+  .pill.speaking  { background: rgba(107,219,107,0.15); color: var(--good); }
+
+  main { display: grid; grid-template-columns: 1fr 320px;
+         gap: 14px; padding: 14px; max-width: 1280px; margin: auto; }
+
+  .panel { background: var(--panel); border: 1px solid var(--line);
+           border-radius: 8px; padding: 14px; }
+  .panel h2 { margin: 0 0 10px; font-size: 12px; text-transform: uppercase;
+              letter-spacing: 0.6px; color: var(--dim); font-weight: 600; }
+
+  /* Mic meter */
+  .meter { display: flex; align-items: center; gap: 10px; }
+  .meter-bar { flex: 1; height: 10px; background: #0f131a; border-radius: 5px;
+               overflow: hidden; position: relative; }
+  .meter-fill { height: 100%; background: linear-gradient(90deg,
+                var(--good) 0%, var(--good) 60%, var(--warn) 80%, var(--hot) 100%);
+                width: 0%; transition: width 60ms linear; }
+  .meter-num { width: 50px; font-variant-numeric: tabular-nums;
+               color: var(--dim); text-align: right; font-size: 12px; }
+
+  /* Conversation */
+  .conv { display: flex; flex-direction: column; gap: 12px;
+          max-height: 65vh; overflow-y: auto; padding-right: 6px; }
+  .turn { border-left: 2px solid var(--line); padding: 0 0 4px 10px; }
+  .turn .heard { color: var(--accent); margin: 0 0 4px; font-size: 13px; }
+  .turn .reply { color: var(--text); margin: 0; font-size: 14px; }
+  .turn .meta  { color: var(--dim); font-size: 11px; margin-top: 4px;
+                 font-variant-numeric: tabular-nums; }
+  .conv:empty::before { content: "(en attente de la première phrase…)";
+                        color: var(--dim); font-style: italic; }
+
+  /* Controls */
+  label { display: block; color: var(--dim); font-size: 12px;
+          margin: 10px 0 4px; }
+  select, input[type=text], textarea {
+    width: 100%; padding: 7px 9px;
+    background: #0f131a; color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; font: inherit;
+    box-sizing: border-box;
+  }
+  textarea { resize: vertical; min-height: 64px; }
+  button {
+    padding: 7px 12px; border-radius: 6px; border: 1px solid var(--line);
+    background: #2c3440; color: var(--text); font: inherit; cursor: pointer;
+  }
+  button:hover { background: #364150; }
+  button.primary { background: var(--accent); color: #06182a; border-color: var(--accent); }
+  button.primary:hover { background: #9fd0ff; }
+  .row { display: flex; gap: 8px; margin-top: 8px; }
+  .row > * { flex: 1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Reachy Voice Agent</h1>
+  <span id="state-pill" class="pill idle">idle</span>
+  <span id="engine-pill" class="pill"></span>
+  <span style="flex:1"></span>
+  <span style="color: var(--dim); font-size: 12px;">live updates via websocket</span>
+</header>
+
+<main>
+  <div>
+    <!-- Mic meter -->
+    <div class="panel">
+      <h2>Microphone</h2>
+      <div class="meter">
+        <div class="meter-bar"><div class="meter-fill" id="meter-fill"></div></div>
+        <div class="meter-num" id="meter-num">0.000</div>
+      </div>
+    </div>
+
+    <!-- Conversation -->
+    <div class="panel" style="margin-top: 14px;">
+      <h2>
+        Conversation
+        <button id="clear-btn" style="float: right; padding: 3px 8px;">Clear</button>
+      </h2>
+      <div class="conv" id="conv"></div>
+    </div>
+  </div>
+
+  <div>
+    <!-- Controls -->
+    <div class="panel">
+      <h2>Audio Input</h2>
+      <select id="device-select"></select>
+      <div class="row">
+        <button id="device-apply">Apply</button>
+        <button id="device-refresh">Refresh</button>
+      </div>
+
+      <h2 style="margin-top: 18px;">Make Reachy Speak</h2>
+      <textarea id="say-text" placeholder="Tape un texte ici puis Speak…"></textarea>
+      <div class="row">
+        <button class="primary" id="say-btn">Speak</button>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+const stateEl   = document.getElementById('state-pill');
+const engineEl  = document.getElementById('engine-pill');
+const fillEl    = document.getElementById('meter-fill');
+const numEl     = document.getElementById('meter-num');
+const convEl    = document.getElementById('conv');
+const deviceSel = document.getElementById('device-select');
+
+function setState(s) {
+  stateEl.textContent = s;
+  stateEl.className = 'pill ' + s;
+}
+function setEngine(e) {
+  engineEl.textContent = e ? ('engine: ' + e) : '';
+  engineEl.className = 'pill';
+}
+function setMic(rms) {
+  const pct = Math.min(100, Math.round(rms * 1500));   // scale: ~0.06 → 90%
+  fillEl.style.width = pct + '%';
+  numEl.textContent = rms.toFixed(3);
+}
+function addTurn(t) {
+  const div = document.createElement('div');
+  div.className = 'turn';
+  div.innerHTML = `
+    <div class="heard">🎤 ${escapeHtml(t.heard || '(silence)')}</div>
+    <div class="reply">🤖 ${escapeHtml(t.reply)}</div>
+    <div class="meta">LM ${t.lm_ms} ms · TTS ${t.tts_ms} ms · ${t.audio_s} s audio</div>`;
+  convEl.prepend(div);                // newest on top
+}
+function clearTurns() { convEl.innerHTML = ''; }
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => (
+    {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
+  ));
+}
+
+// --- audio device list ----------------------------------------------------
+
+async function loadDevices(selectedIdx) {
+  const r = await fetch('/devices');
+  const j = await r.json();
+  deviceSel.innerHTML = '';
+  for (const d of j.devices) {
+    const opt = document.createElement('option');
+    opt.value = d.index;
+    opt.textContent = `[${d.index}] ${d.name} ${d.default ? '(default)' : ''}`;
+    if (selectedIdx != null && d.index === selectedIdx) opt.selected = true;
+    deviceSel.appendChild(opt);
+  }
+}
+document.getElementById('device-refresh').onclick = () => loadDevices();
+document.getElementById('device-apply').onclick = async () => {
+  await fetch('/mic', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({device: parseInt(deviceSel.value, 10)}),
+  });
+};
+
+// --- clear button ---------------------------------------------------------
+
+document.getElementById('clear-btn').onclick = async () => {
+  await fetch('/clear', {method: 'POST'});
+  clearTurns();
+};
+
+// --- speak button ---------------------------------------------------------
+
+document.getElementById('say-btn').onclick = async () => {
+  const text = document.getElementById('say-text').value;
+  if (!text.trim()) return;
+  await fetch('/say', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({text}),
+  });
+};
+
+// --- websocket ------------------------------------------------------------
+
+function connect() {
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onmessage = (ev) => {
+    const m = JSON.parse(ev.data);
+    if (m.type === 'snapshot') {
+      const s = m.snapshot;
+      setState(s.state || 'idle');
+      setEngine(s.engine || '');
+      setMic(s.mic_rms || 0);
+      clearTurns();
+      // Render in chronological order (oldest first, prepend reverses)
+      for (const t of s.turns) addTurn(t);
+      loadDevices(s.mic_device);
+    }
+    else if (m.type === 'mic_rms')    setMic(m.rms);
+    else if (m.type === 'state')      setState(m.state);
+    else if (m.type === 'engine')     setEngine(m.engine);
+    else if (m.type === 'turn')       addTurn(m.turn);
+    else if (m.type === 'history_cleared') clearTurns();
+    else if (m.type === 'mic_device') loadDevices(m.device);
+  };
+  ws.onclose = () => setTimeout(connect, 1500);    // auto-reconnect
+}
+connect();
+</script>
+</body>
+</html>

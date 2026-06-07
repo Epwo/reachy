@@ -1,0 +1,7 @@
+# Wake-word detection (openWakeWord) — runs in .venv_wake.
+# Pure ONNX Runtime, no MLX. Could later coexist with the LM venv.
+openwakeword>=0.6
+onnxruntime
+numpy
+sounddevice
+soundfile

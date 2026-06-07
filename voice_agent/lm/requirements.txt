@@ -7,6 +7,11 @@
 
 mlx-vlm>=0.4.4
 
+# Pin to avoid a recurring downgrade: transformers (pulled by mlx-vlm) needs
+# huggingface-hub>=1.5; other deps sometimes try to drag it back to 1.3.x
+# which breaks the import. Keep it explicit.
+huggingface-hub>=1.5.0,<2.0
+
 # Audio I/O + helpers shared with the test script
 numpy
 soundfile

@@ -1,0 +1,3 @@
+# Optional webui extras — install in whichever venv you run agent.py from.
+fastapi>=0.110
+uvicorn[standard]>=0.27

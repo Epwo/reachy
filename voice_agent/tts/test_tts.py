@@ -184,10 +184,14 @@ def make_tts(engine: str, voice: Optional[str], quantize: int):
     """Instantiate the chosen TTS engine. Voice defaults are engine-specific.
 
     Engines are imported lazily so each venv only needs its own engine's deps:
-      - kyutai → activate .venv_tts   (needs moshi_mlx)
-      - kokoro → activate .venv_kokoro (needs mlx-audio)
+      - kyutai     → activate .venv_tts        (needs moshi_mlx)
+      - kokoro     → activate .venv_kokoro     (needs mlx-audio)
+      - supertonic → activate .venv_supertonic (needs supertonic / onnxruntime)
     """
     q = quantize or None
+    if engine == "supertonic":
+        from tts_supertonic import SupertonicTTS, DEFAULT_FR_VOICE as DEFAULT_VOICE
+        return SupertonicTTS(voice=voice or DEFAULT_VOICE)
     if engine == "kokoro":
         from tts_kokoro import KokoroTTS, DEFAULT_FR_VOICE as DEFAULT_VOICE
         return KokoroTTS(voice=voice or DEFAULT_VOICE, quantize=q)
@@ -200,9 +204,12 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("text", nargs="?",
                         help="Text to speak. Omit for interactive mode.")
-    parser.add_argument("--engine", choices=["kyutai", "kokoro"], default="kyutai",
-                        help="Which TTS to use. Kokoro is much smaller / faster, "
-                             "Kyutai sounds more expressive.")
+    parser.add_argument("--engine", choices=["kyutai", "kokoro", "supertonic"],
+                        default="kyutai",
+                        help="Which TTS to use. Supertonic is the fastest and "
+                             "most multilingual (31 langs); Kokoro is also fast "
+                             "but fewer languages; Kyutai sounds more expressive "
+                             "but is slow on M4 base.")
     parser.add_argument("--voice",
                         help="Voice id. Engine-specific: a path inside "
                              "kyutai/tts-voices for kyutai, or a name like "

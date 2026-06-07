@@ -1,9 +1,15 @@
-reachy_mini_env/
-known_faces/
+# Python
 __pycache__/
 *.pyc
 .DS_Store
 
-# Voice agent venvs
-voice_agent/.venv_lm/
-voice_agent/.venv_tts/
+# Virtualenvs (any name, any location)
+.venv/
+.venv_*/
+*_env/
+reachy_mini_env/
+
+# Runtime data
+known_faces/
+voice_agent/**/wake_captures/
+/tmp_audio/

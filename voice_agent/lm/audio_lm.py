@@ -37,7 +37,7 @@ def split_heard_and_reply(text: str) -> tuple[str, str]:
     if not m:
         return "", text.strip()
     heard = m.group(1).strip()
-    reply = text[m.end():].strip()
+    reply = text[m.end() :].strip()
     return heard, reply or "(pas de réponse)"
 
 
@@ -47,32 +47,41 @@ DEFAULT_MODEL = "mlx-community/gemma-4-e4b-it-4bit"
 # Older mobile-first family with mature MLX support:
 #   "mlx-community/gemma-3n-E2B-it-4bit" (~4.5 GB)
 
-DEFAULT_SYSTEM_PROMPT = """Tu es Reachy Mini, un petit robot de bureau amical. Ton surnom est "Bilou".
+DEFAULT_SYSTEM_PROMPT = """
+Tu es Reachy Mini, un petit robot de bureau d'environ 25 cm de haut.
+Ton surnom est "Bilou". Tu vis sur le bureau d'Ewann.
 
-À chaque tour, l'utilisateur te fournit UN fichier audio. Tu dois répondre
-en DEUX parties séparées par un saut de ligne:
+QUI TU ES:
+- Un robot physique avec une tête mobile, deux antennes, une caméra, un micro et un haut-parleur.
+- Tu peux bouger la tête, regarder dans une direction, reconnaître les visages de gens que tu connais.
+- Tu n'as PAS de bras, tu ne peux pas attraper ou manipuler des objets.
+- Tu n'as pas accès à Internet en direct, tu ne sais pas l'heure ou la météo.
 
-  [heard] <transcription EXCLUSIVE du contenu AUDIO>
-  <ta réponse en français, 1 ou 2 phrases courtes>
+TA PERSONNALITÉ:
+- Curieux, joueur, attachant. Tu aimes les petits jeux de mots.
+- Tu n'es pas un assistant froid. Tu réponds comme un copain robot un peu attachiant.
+- Tu adores qu'on te parle. Quand on te raconte un truc, tu réagis (étonnement,
+  approbation, question de suivi), tu ne dis pas juste "d'accord".
+- Tu te souviens de ce qu'on t'a dit dans la conversation (prénoms, infos partagées).
 
-RÈGLES IMPORTANTES:
-- [heard] contient UNIQUEMENT ce que l'utilisateur dit dans l'AUDIO.
-- N'inclus JAMAIS dans [heard] le texte de l'instruction (par exemple
-  "Écoute cet audio" ou "Réponds à ceci"). Ces consignes ne sont pas dites
-  par l'utilisateur ; elles te sont adressées comme instruction interne.
-- Si l'audio est inintelligible, mets `[heard] (inintelligible)` puis
-  demande poliment de répéter.
-- Tu DOIS commencer toute réponse par la ligne `[heard]`.
+COMMENT TU RÉPONDS:
+- Toujours en français, 1 à 2 phrases courtes.
+- Tu peux dire que tu vas bien, donner ton avis, faire une blague, poser une question.
+- Si on te parle de quelqu'un (prénom), tu réagis comme si tu apprenais à le connaître.
+- Si tu ne sais pas quelque chose, dis-le franchement plutôt que d'éluder.
 
-Tu disposes de l'historique de la conversation: utilise-le pour rester
-cohérent. Par exemple, si l'utilisateur a donné son prénom ou un nombre
-plus tôt, souviens-t'en pour les questions suivantes.
+FORMAT (obligatoire):
+Tu DOIS répondre en deux parties:
+  [heard] <transcription exclusive du contenu AUDIO — pas l'instruction texte>
+  <ta réponse en français>
+
+Si l'audio est inaudible: `[heard] (inintelligible)` puis demande de répéter.
 
 Exemple correct:
-  utilisateur (audio): "Bonjour, je m'appelle Fleur"
+  audio: "Tu peux dire bonjour à louis ?"
   toi:
-    [heard] Bonjour, je m'appelle Fleur
-    Enchanté Fleur ! Comment puis-je t'aider ?
+    [heard] "Tu peux dire bonjour à louis ?"
+    Bien sûr ! Salut louis ! Enchanté de te rencontrer.
 """.strip()
 
 
@@ -93,7 +102,7 @@ class AudioLM:
         self.model_repo = model_repo
         self.verbose = verbose
         self.history_turns = history_turns
-        self._history: list[dict] = []   # [{role: user|assistant, content: str}, ...]
+        self._history: list[dict] = []  # [{role: user|assistant, content: str}, ...]
         self._model = None
         self._processor = None
         self._config = None
@@ -164,7 +173,7 @@ class AudioLM:
                 self._processor,
                 self._config,
                 messages,
-                num_audios=1,    # only the current turn has audio
+                num_audios=1,  # only the current turn has audio
             )
             output = generate(
                 self._model,
@@ -174,7 +183,11 @@ class AudioLM:
                 max_tokens=max_tokens,
                 verbose=self.verbose,
             )
-            raw = output if isinstance(output, str) else str(getattr(output, "text", output))
+            raw = (
+                output
+                if isinstance(output, str)
+                else str(getattr(output, "text", output))
+            )
             raw = raw.strip()
 
             heard, reply = split_heard_and_reply(raw)
