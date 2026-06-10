@@ -38,11 +38,23 @@ def _resolve(model_arg: str) -> str:
 
 
 class WakeDetector:
-    def __init__(self, model: str, threshold: float = 0.5):
+    def __init__(self, model: str, threshold: float = 0.5,
+                 verifier: str = None, verifier_threshold: float = 0.3):
         from openwakeword.model import Model
         self.threshold = threshold
-        self._model = Model(wakeword_models=[_resolve(model)],
-                            inference_framework="onnx")
+
+        model_path = _resolve(model)
+        kwargs = dict(wakeword_models=[model_path], inference_framework="onnx")
+        if verifier:
+            # The verifier dict is keyed by the base model NAME (the key
+            # openWakeWord's predict() uses), i.e. the .onnx basename.
+            from pathlib import Path
+            name = Path(model_path).stem
+            kwargs["custom_verifier_models"] = {name: str(Path(verifier).expanduser())}
+            kwargs["custom_verifier_threshold"] = verifier_threshold
+            print(f"[wake] verifier custom chargé pour '{name}': {verifier}")
+
+        self._model = Model(**kwargs)
         self._buf = np.zeros(0, dtype=np.int16)
         self.last_score = 0.0
 

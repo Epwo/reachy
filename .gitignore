@@ -13,3 +13,5 @@ reachy_mini_env/
 known_faces/
 voice_agent/**/wake_captures/
 /tmp_audio/
+
+.env

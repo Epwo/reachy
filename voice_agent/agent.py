@@ -26,9 +26,11 @@ import argparse
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -37,6 +39,7 @@ import numpy as np
 import soundfile as sf
 
 from audio_io import LaptopBackend, ReachyBackend, VADCapture, WakeGatedCapture
+import tools as toolkit
 
 
 HERE = Path(__file__).resolve().parent
@@ -58,6 +61,19 @@ def _robot_wake(mini, silent: bool = False) -> None:
                          duration=0.8, method="minjerk")
     else:
         mini.wake_up()
+
+
+_EMOJI_RE = re.compile(
+    "[\U0001f000-\U0001faff\U00002600-\U000027bf\U0001f1e6-\U0001f1ff←-⇿⌀-⏿]+"
+)
+
+
+def _clean_for_tts(text: str) -> str:
+    """Strip emojis/pictographs the TTS would mispronounce, tidy whitespace."""
+    if not text:
+        return text
+    text = _EMOJI_RE.sub("", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _robot_sleep(mini, silent: bool = False) -> None:
@@ -157,8 +173,12 @@ TTS_ENGINES = {
 def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
         save_audio_dir: Optional[Path] = None,
         wake_model: Optional[str] = None, wake_threshold: float = 0.5,
+        wake_verifier: Optional[str] = None,
         conversation_timeout: float = 6.0, motion: bool = False,
-        vad_threshold: float = 0.02):
+        vad_threshold: float = 0.02, use_tools: bool = True,
+        barge_enabled: bool = True, barge_threshold: float = 0.05,
+        barge_echo_gain: float = 0.6, barge_min_ms: float = 250.0,
+        record_wake_dir: Optional[Path] = None):
     # We connect to the robot if we use it for audio (ReachyBackend) OR just
     # for movement/animation (--motion with laptop audio = hybrid mode).
     connect_robot = use_robot or motion
@@ -221,7 +241,8 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
     if wake_model:
         from wake_detector import WakeDetector
         print(f"[wake] loading wake model: {wake_model} (threshold {wake_threshold})")
-        detector = WakeDetector(wake_model, threshold=wake_threshold)
+        detector = WakeDetector(wake_model, threshold=wake_threshold,
+                                verifier=wake_verifier)
 
         def _on_wake():
             print("🔔 RÉVEILLÉ")
@@ -244,7 +265,13 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
             on_sleep=_on_sleep,
             on_state=((lambda s: state.set_state(s)) if state else None),
             verbose=True,
+            record_dir=record_wake_dir,
         )
+        # The webui "missed wake word" button needs the capture to exist.
+        if state is not None:
+            state.set_wake_miss_handler(capture.flag_miss)
+        if record_wake_dir is not None:
+            print(f"[wake-rec] enregistrement des détections → {record_wake_dir}/")
         print(f"[wake] Reachy dort. Dis le mot de réveil pour lui parler "
               f"(conversation continue pendant {conversation_timeout:.0f}s).")
     else:
@@ -253,10 +280,87 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
             on_rms=(state.set_mic_rms if state else None),
         )
 
-    def _play_text(text: str) -> tuple[float, float]:
-        """Synthesize + play `text`. Returns (tts_ms, audio_s)."""
+    # One lock serializes all speaking (main turns AND background timer
+    # announcements) so they never interleave on the TTS pipe or the speaker.
+    speak_lock = threading.Lock()
+    active_timers: list = []
+
+    def _announce(text: str) -> None:
+        """Speak `text` from any thread (e.g. a timer firing). Mutes the mic
+        during playback so the robot doesn't hear itself, then restores."""
+        text = _clean_for_tts(text)
+        if not text:
+            return
+        with speak_lock:
+            was_muted = capture.muted
+            capture.muted = True
+            wav = None
+            try:
+                resp = tts.call({"text": text})
+                if resp.get("error"):
+                    print(f"[timer] tts error: {resp['error']}")
+                    return
+                wav = resp["audio_path"]
+                audio, sr = sf.read(wav, dtype="float32", always_2d=False)
+                if audio.ndim == 2:
+                    audio = audio.mean(axis=1)
+                backend.play(audio, sr)
+            finally:
+                if wav and os.path.exists(wav):
+                    try: os.remove(wav)
+                    except OSError: pass
+                time.sleep(0.2)
+                capture._drain()
+                capture.muted = was_muted
+
+    def _schedule_timer(seconds: float, label: str) -> None:
+        def _fire():
+            lbl = f" de {label}" if label else ""
+            print(f"[timer] ⏰ minuteur{lbl} terminé")
+            _announce(f"Ding ding ! Ton minuteur{lbl} est terminé !")
+        t = threading.Timer(seconds, _fire)
+        t.daemon = True
+        t.start()
+        active_timers.append(t)
+        print(f"[timer] ⏱  programmé : {seconds:.0f}s ({label})")
+
+    def _monitored_play(audio: np.ndarray, sr: int) -> bool:
+        """Play `audio` while listening for the user barging in. Returns True
+        if interrupted. Uses echo-compensated energy: mic level minus a
+        fraction of the clip's own level at the current playback position, so
+        the robot's own voice doesn't trigger a false interruption."""
+        win = max(1, int(sr * 0.03))                 # 30 ms RMS window on the clip
+        backend.play_async(audio, sr)
+        t_start = time.monotonic()
+        sustained = 0.0
+        # Mic is NOT muted here — we need to hear a possible interruption.
+        while backend.playback_active():
+            chunk = backend.read_chunk()
+            if chunk is None:
+                time.sleep(0.005)
+                continue
+            mic_rms = float(np.sqrt(np.mean(chunk * chunk) + 1e-9))
+            # Concurrent level of the clip itself (echo we expect to hear).
+            pos = int((time.monotonic() - t_start) * sr)
+            seg = audio[max(0, pos - win):pos]
+            clip_rms = float(np.sqrt(np.mean(seg * seg) + 1e-9)) if len(seg) else 0.0
+            effective = mic_rms - barge_echo_gain * clip_rms
+            if effective > barge_threshold:
+                sustained += len(chunk) * 1000 / sr
+                if sustained >= barge_min_ms:
+                    backend.stop_playback()
+                    return True
+            else:
+                sustained = 0.0
+        return False
+
+    def _play_text(text: str, allow_barge: bool = True) -> tuple[float, float]:
+        """Synthesize + play `text`. Returns (tts_ms, audio_s).
+        If barge-in is enabled and the user interrupts, playback stops early
+        and barge_state['interrupted'] is set."""
         nonlocal_wav: Optional[str] = None
         try:
+          with speak_lock:   # serialize vs. background timer announcements
             if state: state.set_state("speaking")
             t0 = time.monotonic()
             resp = tts.call({"text": text})
@@ -270,19 +374,50 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
                 audio = audio.mean(axis=1)
             audio_s = len(audio) / sr
             print(f"[tts {t_tts:.2f}s, {audio_s:.2f}s audio]")
-            capture.muted = True
-            try:
-                backend.play(audio, sr)
-            finally:
-                time.sleep(0.3)
-                capture._drain()
-                capture.muted = False
+
+            do_barge = allow_barge and barge_enabled
+            if do_barge:
+                interrupted = _monitored_play(audio, sr)
+                if interrupted:
+                    print("[barge] ✋ interrompu — j'écoute")
+                    # Don't drain: keep the user's ongoing speech for capture.
+                else:
+                    time.sleep(0.3)
+                    capture._drain()
+            else:
+                capture.muted = True
+                try:
+                    backend.play(audio, sr)
+                finally:
+                    time.sleep(0.3)
+                    capture._drain()
+                    capture.muted = False
             return t_tts * 1000, audio_s
         finally:
             if nonlocal_wav and os.path.exists(nonlocal_wav):
                 try: os.remove(nonlocal_wav)
                 except OSError: pass
             if state: state.set_state("idle")
+
+    # Tools: docs appended to the system prompt + a context dict tools receive.
+    tools_extra = toolkit.tools_system_prompt() if use_tools else ""
+    tool_ctx = {"mini": mini, "capture": capture, "hybrid": hybrid}
+    if use_tools:
+        names = ", ".join(toolkit.TOOLS.keys())
+        print(f"[tools] activés: {names}")
+        if os.environ.get("BRAVE_API_KEY"):
+            print("[tools] recherche web: Brave (BRAVE_API_KEY)")
+        else:
+            try:
+                import ddgs  # noqa: F401
+                print("[tools] recherche web: DuckDuckGo (gratuit, sans clé)")
+            except ImportError:
+                print("[tools] recherche web: indisponible (pip install ddgs)")
+
+    if barge_enabled:
+        print(f"[barge] interruption activée (seuil {barge_threshold:.3f}, "
+              f"écho-gain {barge_echo_gain:.2f}) — parle pour l'interrompre. "
+              f"Idéal avec le micro de Reachy (AEC) ou un casque.")
 
     print("\nReady. Speak in French. Ctrl-C to quit.\n")
     try:
@@ -311,43 +446,91 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
                 # Step 1: audio → text
                 if state: state.set_state("thinking")
                 t0 = time.monotonic()
-                resp = lm.call({"audio_path": wav_in})
+                resp = lm.call({"audio_path": wav_in, "extra_system": tools_extra})
                 t_lm = time.monotonic() - t0
                 if resp.get("error"):
                     print(f"[lm error] {resp['error']}")
                     continue
                 heard = resp.get("heard") or ""
-                reply_text = resp.get("reply") or resp.get("raw") or ""
+                raw_reply = resp.get("reply") or resp.get("raw") or ""
                 if heard:
                     print(f"\n[heard] {heard}")
-                print(f"[reply {t_lm:.2f}s] {reply_text}")
 
-                # Write the sidecar JSON next to the saved WAV so we can
-                # diff the model's transcript against ground truth later.
+                # Step 1b: parse + run any tool calls the model emitted.
+                tool_calls, spoken = toolkit.parse_tool_calls(raw_reply)
+                terminal = False
+                followups: list[str] = []
+                for name, args in tool_calls:
+                    r = toolkit.dispatch(name, args, tool_ctx)
+                    print(f"[tool] {name} {args!r} → {r.note or r.followup or 'ok'}")
+                    terminal = terminal or r.terminal
+                    if r.followup:
+                        followups.append(r.followup)
+                    if r.timer_seconds:
+                        _schedule_timer(r.timer_seconds, r.timer_label)
+
+                # Fallback: the model sometimes puts its spoken goodbye as the
+                # argument of an argless tool, e.g. `[tool:sleep] À bientôt !`.
+                # If we have no separate spoken text but a terminal tool carried
+                # sentence-like args, speak those so it says goodbye before
+                # going to sleep.
+                if not spoken and terminal:
+                    for name, args in tool_calls:
+                        if name == "sleep" and len(args.split()) >= 2:
+                            spoken = args
+                            break
+
+                spoken = _clean_for_tts(spoken)
+                print(f"[reply {t_lm:.2f}s] {spoken}")
+
                 if saved_path is not None:
                     meta_path = saved_path.with_suffix(".json")
                     try:
                         meta_path.write_text(json.dumps({
                             "wav": saved_path.name,
                             "duration_s": round(len(utterance) / 16000, 3),
-                            "samplerate": 16000,
                             "gemma_heard": heard,
-                            "gemma_reply": reply_text,
+                            "gemma_reply": raw_reply,
+                            "tools": [n for n, _ in tool_calls],
                             "lm_ms": round(t_lm * 1000, 1),
                             "timestamp": time.time(),
                         }, ensure_ascii=False, indent=2), encoding="utf-8")
                     except OSError as e:
                         print(f"[save_audio] failed to write {meta_path}: {e}")
 
-                # Step 2 + 3: synthesize + play
-                t_tts_ms, audio_s = _play_text(reply_text)
+                # Step 2: decide what to say.
+                if followups:
+                    # Quick feedback while we fetch + reason (search latency).
+                    if spoken:
+                        _play_text(spoken)
+                    if state: state.set_state("thinking")
+                    # No tools_extra here: the 2nd pass is a pure summary task,
+                    # it must NOT emit new [tool:...] calls.
+                    fr = lm.call({"command": "respond_text",
+                                  "text": "\n".join(followups)})
+                    answer = (fr.get("reply") if not fr.get("error") else None) \
+                             or "Désolé, je n'ai rien trouvé."
+                    print(f"[reply+] {answer}")
+                    t_tts_ms, audio_s = _play_text(answer)
+                    final_reply = answer
+                else:
+                    final_reply = spoken
+                    t_tts_ms, audio_s = _play_text(spoken) if spoken else (0.0, 0.0)
 
                 if state:
                     from webui import Turn
                     state.add_turn(Turn(
-                        heard=heard, reply=reply_text,
+                        heard=heard, reply=final_reply,
                         lm_ms=t_lm * 1000, tts_ms=t_tts_ms, audio_s=audio_s,
                     ))
+
+                # Step 3: sleep tool → end the conversation now.
+                if terminal:
+                    if hasattr(capture, "end_conversation"):
+                        capture.end_conversation()
+                    elif mini is not None:
+                        try: _robot_sleep(mini, silent=hybrid)
+                        except Exception: pass
             finally:
                 for p in (wav_in, wav_out):
                     if p and os.path.exists(p):
@@ -358,6 +541,9 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
     except KeyboardInterrupt:
         print("\nStopping.")
     finally:
+        for t in active_timers:
+            try: t.cancel()
+            except Exception: pass
         lm.close()
         tts.close()
         if mini_ctx is not None:
@@ -405,6 +591,29 @@ def main():
                              "wake word (default 0.02). RAISE it if Reachy "
                              "never goes back to sleep (mic noise floor too "
                              "high); lower it if it misses quiet speech.")
+    parser.add_argument("--no-tools", action="store_true",
+                        help="Disable tool calling (sleep, web search, emotes). "
+                             "Web search needs BRAVE_API_KEY in the env.")
+    parser.add_argument("--no-barge", action="store_true",
+                        help="Disable barge-in (interrupting Reachy while he "
+                             "speaks). With it on, talk over him to stop him.")
+    parser.add_argument("--barge-threshold", type=float, default=0.05,
+                        help="Echo-compensated energy needed to interrupt "
+                             "(default 0.05). Lower = easier to interrupt but "
+                             "more false stops; raise it if his own voice "
+                             "keeps stopping him (laptop mic near speaker).")
+    parser.add_argument("--barge-echo-gain", type=float, default=0.6,
+                        help="How much of his own voice to subtract from the "
+                             "mic when checking for interruption (0–1, default "
+                             "0.6). Higher if the speaker bleeds into the mic.")
+    parser.add_argument("--record-wake", metavar="DIR",
+                        help="Record wake-word events (detections, near-misses, "
+                             "and web-UI-flagged misses) to DIR as WAV+JSON, for "
+                             "labeling + retraining. See wake/label_recordings.py.")
+    parser.add_argument("--wake-verifier", metavar="JOBLIB",
+                        help="Custom verifier model (from wake/train_verifier.py) "
+                             "to filter out false detections using your own "
+                             "voice + false-trigger clips.")
     args = parser.parse_args()
 
     save_dir = None
@@ -413,12 +622,23 @@ def main():
         save_dir.mkdir(parents=True, exist_ok=True)
         print(f"[save_audio] writing utterances to {save_dir}/")
 
+    record_wake_dir = None
+    if args.record_wake:
+        record_wake_dir = Path(args.record_wake).expanduser().resolve()
+        record_wake_dir.mkdir(parents=True, exist_ok=True)
+
     run(use_robot=not args.no_robot, tts_engine=args.tts,
         webui=args.webui, webui_port=args.webui_port,
         save_audio_dir=save_dir,
         wake_model=args.wake, wake_threshold=args.wake_threshold,
+        wake_verifier=args.wake_verifier,
         conversation_timeout=args.conversation_timeout,
-        motion=args.motion, vad_threshold=args.vad_threshold)
+        motion=args.motion, vad_threshold=args.vad_threshold,
+        use_tools=not args.no_tools,
+        barge_enabled=not args.no_barge,
+        barge_threshold=args.barge_threshold,
+        barge_echo_gain=args.barge_echo_gain,
+        record_wake_dir=record_wake_dir)
 
 
 if __name__ == "__main__":

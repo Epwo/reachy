@@ -158,28 +158,72 @@ and waits for both to report ready (each loads + warms its model — about
 30 s total on M4 base). Then it listens; speak in French and the robot
 replies in French.
 
+## Tools (function calling)
+
+The model can trigger actions by emitting `[tool:name] args` lines in its
+reply. The agent parses them, runs the tool, and (for tools that fetch
+information, like web search) does a 2nd LM pass to speak a natural answer.
+Tools are on by default; disable with `--no-tools`.
+
+Implemented:
+
+- **`sleep`** — "va dormir / tais-toi" → robot goes back to sleep (ends the
+  wake-conversation).
+- **`search`** — web search. Default backend is **DuckDuckGo** via the free
+  `ddgs` package (no API key, no signup):
+  ```bash
+  source .venv_supertonic/bin/activate
+  uv pip install -r requirements_tools.txt   # installs ddgs
+  python agent.py --wake wake/models/billou.onnx
+  ```
+  Optionally, set `BRAVE_API_KEY` to use the Brave Search API instead (higher
+  quality, but the free tier needs a verified account). DuckDuckGo needs
+  nothing.
+
+Placeholders (acknowledged but not yet wired to motion — edit `tools.py`):
+`emote`, `look`, `nod`, `shake`, `dance`.
+
+Add a tool = one `@tool(...)` function in [`tools.py`](tools.py); its
+description is shown to the model automatically.
+
 ## Memory budget on a 12 GB Mac
 
-| Component | Approx RAM |
-|---|---|
-| Gemma 4 E2B (bf16, in .venv_lm) | ~3 GB |
-| Kokoro-82M bf16 (in .venv_kokoro) | ~0.5 GB |
-| Python + MLX runtime per process | ~0.5 GB each |
-| macOS + light background apps | ~3-4 GB |
-| **Total** | **~7-8 GB** |
+| Component                         | Approx RAM   |
+| --------------------------------- | ------------ |
+| Gemma 4 E2B (bf16, in .venv_lm)   | ~3 GB        |
+| Kokoro-82M bf16 (in .venv_kokoro) | ~0.5 GB      |
+| Python + MLX runtime per process  | ~0.5 GB each |
+| macOS + light background apps     | ~3-4 GB      |
+| **Total**                         | **~7-8 GB**  |
 
 Plenty of headroom on 12 GB now. The Kokoro switch is the single
 biggest win for this hardware — it removed ~3 GB of resident weights
 and the ~1.5 RTF that came with Kyutai.
 
+## Barge-in (interrupting while it speaks)
+
+On by default: talk over Reachy and he stops to listen. Detection is
+energy-based with a "poor man's AEC" — the mic level minus a fraction of the
+clip's own level at the current playback position, so his own voice doesn't
+trigger a false stop.
+
+- **Best with Reachy's mic** (`python agent.py` full robot): the ReSpeaker does
+  hardware echo cancellation, so only *your* voice reaches the detector.
+- **Laptop mic near the speaker**: his voice can be louder than yours — tune
+  `--barge-threshold` up and `--barge-echo-gain` toward your real echo level,
+  or wear headphones. Or disable with `--no-barge`.
+
+```bash
+python agent.py --wake wake/models/billou.onnx              # barge-in on
+python agent.py --wake ... --barge-threshold 0.08           # harder to trigger
+python agent.py --wake ... --no-barge                       # off
+```
+
 ## Known caveats
 
-- **No tool calling yet.** The agent transcribes → generates text → speaks;
-  it doesn't call any robot-action functions. If you want the model to be
-  able to look around, set expressions, etc., we need to add a parser
-  that watches Gemma's output for tool-call markers.
-- **No barge-in.** While the robot speaks, your mic is muted. Improving
-  this would need echo cancellation, not just VAD.
+- **Barge-in on laptop mic is approximate.** Without true AEC, a speaker close
+  to the mic can self-trigger or be hard to interrupt; see tuning above. Real
+  WebRTC AEC would fix it but adds a dependency.
 - **Kokoro default voice** is `ff_siwis` (Swiss French female). For other
   voices browse `mlx-community/Kokoro-82M-*` voice files or use
   `:voice <name>` inside `test_tts.py --engine kokoro` to try them.

@@ -122,6 +122,16 @@
       <div class="row">
         <button class="primary" id="say-btn">Speak</button>
       </div>
+
+      <h2 style="margin-top: 18px;">Wake-word — collecte de données</h2>
+      <div class="row">
+        <button id="miss-btn">😞 J'ai dit le mot, raté</button>
+      </div>
+      <div style="color: var(--dim); font-size: 11px; margin-top: 6px;">
+        À cliquer juste après avoir dit « billou » s'il ne s'est PAS réveillé.
+        Enregistre l'audio récent comme exemple à ré-apprendre.
+        (nécessite <code>--record-wake DIR</code>)
+      </div>
     </div>
   </div>
 </main>
@@ -202,6 +212,16 @@ document.getElementById('say-btn').onclick = async () => {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({text}),
   });
+};
+
+// --- wake-miss button -----------------------------------------------------
+
+document.getElementById('miss-btn').onclick = async () => {
+  await fetch('/wake_miss', {method: 'POST'});
+  const b = document.getElementById('miss-btn');
+  const old = b.textContent;
+  b.textContent = '✅ enregistré';
+  setTimeout(() => { b.textContent = old; }, 1200);
 };
 
 // --- websocket ------------------------------------------------------------

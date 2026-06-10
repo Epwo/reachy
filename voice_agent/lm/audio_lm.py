@@ -85,6 +85,28 @@ Exemple correct:
 """.strip()
 
 
+# Used for the 2nd-pass text turn (e.g. summarizing web-search results). This
+# is a TEXT task, not an audio one — no [heard] scaffold, no tool syntax, and
+# an explicit instruction to synthesize rather than echo the raw data.
+FOLLOWUP_SYSTEM_PROMPT = """
+Tu es Reachy Mini ("Bilou"), un petit robot de bureau amical.
+On vient de te fournir des informations (résultats de recherche web, etc.).
+
+Ta tâche: répondre à l'utilisateur EN FRANÇAIS, en 1 ou 2 phrases courtes,
+naturelles et parlées, en te basant sur ces informations.
+
+RÈGLES:
+- Ne récite PAS les résultats bruts, ne liste pas "1. ... 2. ...".
+- Fais une vraie réponse de robot qui parle, comme si tu savais l'info.
+- Garde uniquement ce qui répond à la question (température, date, fait…).
+- Ne mets AUCUNE ligne [heard] ni [tool:...].
+
+Exemple:
+  infos: "Résultats web pour «météo Paris» : ... 18°C cet après-midi ..."
+  toi: "À Paris il fait environ 18 degrés cet après-midi, plutôt nuageux."
+""".strip()
+
+
 class AudioLM:
     """Audio + text → text on MLX. Lazy-loads the model on first use.
 
@@ -140,6 +162,7 @@ class AudioLM:
         self,
         audio: "str | np.ndarray",
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+        extra_system: str = "",   # appended to the system prompt (e.g. tool docs)
         # Minimal user prompt — the audio is what matters, the text is just
         # there because chat templates require non-empty user content. Kept
         # short so the model has less text to confuse with the audio when
@@ -161,11 +184,12 @@ class AudioLM:
         from mlx_vlm import generate
         from mlx_vlm.prompt_utils import apply_chat_template
 
+        sys_prompt = system_prompt + (f"\n\n{extra_system}" if extra_system else "")
         wav_path, cleanup = _ensure_wav(audio, sample_rate)
         try:
             # Build: system + history + current user (text prompt; audio attached
             # via the `audio=` kwarg below).
-            messages: list[dict] = [{"role": "system", "content": system_prompt}]
+            messages: list[dict] = [{"role": "system", "content": sys_prompt}]
             messages.extend(self._history)
             messages.append({"role": "user", "content": user_prompt})
 
@@ -203,6 +227,44 @@ class AudioLM:
             return {"heard": heard, "reply": reply, "raw": raw}
         finally:
             cleanup()
+
+    def respond_text(
+        self,
+        text: str,
+        system_prompt: str = FOLLOWUP_SYSTEM_PROMPT,
+        extra_system: str = "",
+        max_tokens: int = 256,
+    ) -> str:
+        """Text-only turn (no audio). Used for the 2nd pass after a tool runs
+        (e.g. turning web-search results into a spoken answer). Uses the
+        summary-focused FOLLOWUP prompt by default, NOT the audio/[heard]
+        persona prompt. Updates conversation history. Returns the reply."""
+        self._ensure_loaded()
+        from mlx_vlm import generate
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        sys_prompt = system_prompt + (f"\n\n{extra_system}" if extra_system else "")
+        messages: list[dict] = [{"role": "system", "content": sys_prompt}]
+        messages.extend(self._history)
+        messages.append({"role": "user", "content": text})
+
+        formatted = apply_chat_template(
+            self._processor, self._config, messages, num_images=0,
+        )
+        output = generate(
+            self._model, self._processor, formatted,
+            max_tokens=max_tokens, verbose=self.verbose,
+        )
+        reply = (output if isinstance(output, str)
+                 else str(getattr(output, "text", output))).strip()
+        # A followup answer shouldn't carry the [heard] scaffold; strip if present.
+        if reply.lower().startswith("[heard]"):
+            _, reply = split_heard_and_reply(reply)
+
+        self._history.append({"role": "user", "content": text})
+        self._history.append({"role": "assistant", "content": reply})
+        self._trim_history()
+        return reply
 
 
 # ---------------------------------------------------------------------------

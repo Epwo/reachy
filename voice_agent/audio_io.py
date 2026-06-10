@@ -10,6 +10,7 @@ VAD endpointing is energy-based RMS — cheap, no extra deps.
 from __future__ import annotations
 
 import time
+from collections import deque
 from typing import Iterator
 
 import numpy as np
@@ -56,6 +57,11 @@ class ReachyBackend(AudioBackend):
         return self.mini.media.get_input_audio_samplerate()
 
     def play(self, audio: np.ndarray, sr: int):
+        self.play_async(audio, sr)
+        while self.playback_active():
+            time.sleep(0.02)
+
+    def play_async(self, audio: np.ndarray, sr: int):
         try:
             sr_out = self.mini.media.get_output_audio_samplerate()
         except Exception:
@@ -64,7 +70,17 @@ class ReachyBackend(AudioBackend):
             audio = _resample_mono(audio, sr, sr_out)
         self.mini.media.start_playing()
         self.mini.media.push_audio_sample(audio.reshape(-1, 1).astype(np.float32))
-        time.sleep(len(audio) / sr_out + 0.1)
+        self._play_end = time.monotonic() + len(audio) / sr_out + 0.1
+
+    def stop_playback(self):
+        try:
+            self.mini.media.stop_playing()
+        except Exception:
+            pass
+        self._play_end = 0.0
+
+    def playback_active(self) -> bool:
+        return time.monotonic() < getattr(self, "_play_end", 0.0)
 
 
 class LaptopBackend(AudioBackend):
@@ -124,6 +140,20 @@ class LaptopBackend(AudioBackend):
 
     def play(self, audio: np.ndarray, sr: int):
         self.sd.play(audio, samplerate=sr, blocking=True)
+
+    def play_async(self, audio: np.ndarray, sr: int):
+        self.sd.play(audio, samplerate=sr, blocking=False)
+        self._play_end = time.monotonic() + len(audio) / sr
+
+    def stop_playback(self):
+        try:
+            self.sd.stop()
+        except Exception:
+            pass
+        self._play_end = 0.0
+
+    def playback_active(self) -> bool:
+        return time.monotonic() < getattr(self, "_play_end", 0.0)
 
 
 class VADCapture:
@@ -232,7 +262,9 @@ class WakeGatedCapture:
                  on_wake=None,
                  on_sleep=None,
                  on_state=None,
-                 verbose: bool = False):
+                 verbose: bool = False,
+                 record_dir=None,
+                 near_threshold: float = 0.3):
         self.backend = backend
         self.wake = wake_detector
         self.threshold = threshold
@@ -247,6 +279,56 @@ class WakeGatedCapture:
         self.on_wake = on_wake      # called when wake fires (asleep→awake)
         self.on_sleep = on_sleep    # called when conversation ends (awake→asleep)
         self.on_state = on_state    # called with "asleep"/"awake" on transitions
+        self._force_sleep = False   # set by end_conversation() (e.g. sleep tool)
+
+        # --- wake-word data collection -----------------------------------
+        # When record_dir is set, keep a rolling 16 kHz buffer of recent mic
+        # audio so we can dump a clip around any event (detection / miss /
+        # near-miss) for later labeling + retraining.
+        from pathlib import Path as _Path
+        self.record_dir = _Path(record_dir) if record_dir else None
+        self.near_threshold = near_threshold
+        self._ring16: deque = deque(maxlen=int(SAMPLE_RATE * 2.0 / 1280) + 4)  # ~2s
+        self._last_near_save = 0.0
+        self._flag_miss = False
+        if self.record_dir:
+            for sub in ("detections", "misses", "nearmiss"):
+                (self.record_dir / sub).mkdir(parents=True, exist_ok=True)
+
+    def end_conversation(self) -> None:
+        """Force the current conversation to end after the in-flight turn, so
+        the robot goes back to sleep (used by the `sleep` tool)."""
+        self._force_sleep = True
+
+    def flag_miss(self) -> None:
+        """Mark that the user just said the wake word but it was NOT detected.
+        The Phase-1 loop saves the recent audio buffer as a 'miss' for
+        retraining. Triggered from the web UI."""
+        self._flag_miss = True
+
+    def _save_clip(self, kind: str, score: float) -> None:
+        """Dump the rolling 16 kHz buffer to record_dir/<kind>/ + a sidecar."""
+        if not self.record_dir or not self._ring16:
+            return
+        import json as _json
+        score = float(score)   # may be a numpy float32 → not JSON-serializable
+        audio = np.concatenate(list(self._ring16))
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        stem = f"{ts}_{int(time.time()*1000) % 1000:03d}_s{score:.2f}"
+        wav = self.record_dir / kind / f"{stem}.wav"
+        try:
+            import soundfile as _sf
+            _sf.write(str(wav), audio, SAMPLE_RATE, subtype="PCM_16")
+            (self.record_dir / kind / f"{stem}.json").write_text(
+                _json.dumps({"kind": kind, "score": round(score, 3),
+                             "threshold": float(self.wake.threshold),
+                             "duration_s": round(len(audio) / SAMPLE_RATE, 2),
+                             "timestamp": time.time(), "label": None},
+                            ensure_ascii=False, indent=2), encoding="utf-8")
+            if self.verbose:
+                print(f"[wake-rec] {kind} → {wav.name}")
+        except Exception as e:
+            print(f"[wake-rec] échec sauvegarde {kind}: {e}")
 
     def _drain(self) -> None:
         while self.backend.read_chunk() is not None:
@@ -295,8 +377,27 @@ class WakeGatedCapture:
                         try: self.on_rms(rms)
                         except Exception: pass
                     wk = _resample_mono(chunk, sr, SAMPLE_RATE) if sr != SAMPLE_RATE else chunk
-                    if self.wake.triggered(wk):
+
+                    if self.record_dir is not None:
+                        self._ring16.append(wk.astype(np.float32))
+
+                    score = self.wake.feed(wk)
+                    if score >= self.wake.threshold:
                         triggered = True
+                        if self.record_dir is not None:
+                            self._save_clip("detections", score)
+                    elif self.record_dir is not None:
+                        # Near-miss: score approached the threshold but didn't
+                        # reach it. Debounced to ~1/s so we don't flood.
+                        if (self.near_threshold and score >= self.near_threshold
+                                and time.monotonic() - self._last_near_save > 1.0):
+                            self._save_clip("nearmiss", score)
+                            self._last_near_save = time.monotonic()
+                        # User flagged a miss from the web UI.
+                        if self._flag_miss:
+                            self._flag_miss = False
+                            self._save_clip("misses", score)
+                            print("[wake-rec] raté enregistré (flag utilisateur)")
 
                 # Wake animation (may play a sound) — fire it, then drain the
                 # buffer so we don't capture the animation noise.
@@ -309,6 +410,7 @@ class WakeGatedCapture:
 
                 # ---- Phase 2: AWAKE — conversation loop -------------------
                 first = True
+                self._force_sleep = False
                 while True:
                     wait = self.max_wait_s if first else self.conversation_timeout
                     first = False
@@ -326,6 +428,12 @@ class WakeGatedCapture:
                         yield phrase
                         # On resume, the agent has finished LM+TTS+playback and
                         # cleared `muted`; we loop to listen for a follow-up.
+                    if self._force_sleep:
+                        # The `sleep` tool ran during this turn → end now.
+                        self._force_sleep = False
+                        if self.verbose:
+                            print("[wake] 💤 outil sleep → rendormissement")
+                        break
 
                 # ---- Back to sleep ----------------------------------------
                 if self.on_sleep:

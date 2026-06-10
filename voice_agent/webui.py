@@ -80,6 +80,7 @@ class AgentState:
         self._on_clear_history: Optional[Callable[[], None]] = None
         self._on_say: Optional[Callable[[str], None]] = None
         self._on_switch_mic: Optional[Callable[[int], None]] = None
+        self._on_wake_miss: Optional[Callable[[], None]] = None
 
     # ---- producer side (called from agent thread) -----------------------
 
@@ -180,6 +181,15 @@ class AgentState:
         if self._on_switch_mic:
             self._on_switch_mic(device)
 
+    def set_wake_miss_handler(self, fn: Callable[[], None]) -> None:
+        """Bound separately because the capture object doesn't exist yet when
+        bind_handlers() is first called."""
+        self._on_wake_miss = fn
+
+    def wake_miss(self) -> None:
+        if self._on_wake_miss:
+            self._on_wake_miss()
+
 
 # ---------------------------------------------------------------------------
 # Audio device enumeration
@@ -252,6 +262,13 @@ def build_app(state: AgentState) -> FastAPI:
         except (TypeError, ValueError):
             return JSONResponse({"error": "bad device index"}, status_code=400)
         state.switch_mic(idx)
+        return JSONResponse({"ok": True})
+
+    @app.post("/wake_miss")
+    async def post_wake_miss() -> JSONResponse:
+        # "I said the wake word but Reachy didn't hear it" — saves the recent
+        # audio buffer as a training-positive (false negative).
+        state.wake_miss()
         return JSONResponse({"ok": True})
 
     @app.websocket("/ws")

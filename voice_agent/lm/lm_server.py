@@ -20,8 +20,17 @@ On failure: {"heard": null, "reply": null, "error": "..."}
 from __future__ import annotations
 
 import json
+import os
 import sys
 import traceback
+
+# Skip huggingface_hub's slow online file-existence checks IF the model is
+# already cached. Opt-in via HF_HUB_OFFLINE=1 (don't force it, so switching to
+# a not-yet-downloaded model still works). The warmup below is what actually
+# removes the first-turn delay.
+#   export HF_HUB_OFFLINE=1   # for an extra speedup once everything is cached
+
+import numpy as np
 
 from audio_lm import AudioLM, DEFAULT_SYSTEM_PROMPT
 
@@ -39,7 +48,15 @@ def main():
     lm = AudioLM()
     log("loading model...")
     lm._ensure_loaded()
-    log("model loaded.")
+    log("warming up (compiles MLX kernels)...")
+    # Run one throwaway inference on 1s of silence so the FIRST real turn
+    # doesn't pay the kernel-compilation + HF-check cost. Then wipe history.
+    try:
+        lm.respond(np.zeros(16000, dtype=np.float32), max_tokens=4)
+    except Exception as e:
+        log(f"warmup failed (non-fatal): {e}")
+    lm.clear_history()
+    log("ready.")
     emit({"ready": True})
 
     for line in sys.stdin:
@@ -56,10 +73,18 @@ def main():
             if job.get("command") == "get_history":
                 emit({"history": lm.get_history()})
                 continue
+            if job.get("command") == "respond_text":
+                # 2nd-pass text turn (e.g. after a web search).
+                reply = lm.respond_text(
+                    job["text"],
+                    extra_system=job.get("extra_system", ""),
+                )
+                emit({"reply": reply, "error": None})
+                continue
 
             result = lm.respond(
                 job["audio_path"],
-                system_prompt=job.get("system_prompt", DEFAULT_SYSTEM_PROMPT),
+                extra_system=job.get("extra_system", ""),
                 user_prompt=job.get("user_prompt", "Écoute cet audio et réponds."),
             )
             emit({**result, "error": None})
