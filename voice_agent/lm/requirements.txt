@@ -1,18 +1,14 @@
-# Voice agent — STEP 1 venv (audio understanding)
-# Install with:  uv venv .venv_lm && source .venv_lm/bin/activate && uv pip install -r requirements_lm.txt
+# Voice agent — chat-VLM venv (step 2: text/vision -> French reply)
+# Install with:
+#   uv venv .venv_lm && uv pip install --python .venv_lm/bin/python -r lm/requirements.txt
 #
-# Uses Gemma 4 E4B (audio + text in -> text out) via mlx-vlm. Newer mlx
-# is required, which is incompatible with the moshi_mlx pin used by
-# the Kyutai TTS step — they live in separate environments.
+# Uses Qwen3.5-4B (a vision-language model) via mlx-vlm, so Bilou can both chat
+# and describe what its camera sees. Newer mlx is required, incompatible with
+# the moshi_mlx pin used by the Kyutai TTS step, so they live in separate envs.
 
-mlx-vlm>=0.6.2          # 0.6.2+ needed to load Gemma 4 QAT quant format
+mlx-vlm>=0.6.3          # 0.6.3+ handles the Qwen3.5 MoE conversion
 
 # Pin to avoid a recurring downgrade: transformers (pulled by mlx-vlm) needs
-# huggingface-hub>=1.5; other deps sometimes try to drag it back to 1.3.x
-# which breaks the import. Keep it explicit.
+# huggingface-hub>=1.5; other deps sometimes drag it back to 1.3.x which breaks
+# the import. Keep it explicit.
 huggingface-hub>=1.5.0,<2.0
-
-# Audio I/O + helpers shared with the test script
-numpy
-soundfile
-sounddevice

@@ -92,7 +92,8 @@ class LaptopBackend(AudioBackend):
     """
 
     def __init__(self, samplerate: int = 16000, chunk_ms: int = 100,
-                 device: Optional[int] = None):
+                 device: Optional[int] = None,
+                 output_device: Optional[int] = None):
         import sounddevice as sd
         import queue
         self.sd = sd
@@ -101,6 +102,17 @@ class LaptopBackend(AudioBackend):
         self.chunk_frames = int(samplerate * chunk_ms / 1000)
         self._stream = None
         self._device = device
+        # Resolve the output device + its native sample rate. CoreAudio raises
+        # paramErr (-50) if we hand it audio at a rate the device can't open
+        # (e.g. 44.1 kHz TTS -> a 16 kHz "Reachy Mini Audio" default device),
+        # so we resample to the device rate before playing.
+        self._out_device = (output_device if output_device is not None
+                            else (sd.default.device[1] if sd.default.device else None))
+        try:
+            info = sd.query_devices(self._out_device, "output")
+            self._out_sr = int(info["default_samplerate"])
+        except Exception:
+            self._out_sr = 48000  # safe, widely-supported fallback
 
     def _callback(self, indata, frames, time_, status):
         if status:
@@ -138,11 +150,24 @@ class LaptopBackend(AudioBackend):
     def input_samplerate(self) -> int:
         return self.samplerate
 
+    def _prep(self, audio: np.ndarray, sr: int) -> tuple[np.ndarray, int]:
+        """Resample to the output device's native rate so CoreAudio accepts it.
+        Returns (audio, samplerate_to_play_at)."""
+        if sr == self._out_sr:
+            return audio, sr
+        from scipy.signal import resample_poly
+        from math import gcd
+        g = gcd(int(self._out_sr), int(sr))
+        out = resample_poly(audio, int(self._out_sr) // g, int(sr) // g)
+        return out.astype(np.float32), self._out_sr
+
     def play(self, audio: np.ndarray, sr: int):
-        self.sd.play(audio, samplerate=sr, blocking=True)
+        audio, sr = self._prep(audio, sr)
+        self.sd.play(audio, samplerate=sr, blocking=True, device=self._out_device)
 
     def play_async(self, audio: np.ndarray, sr: int):
-        self.sd.play(audio, samplerate=sr, blocking=False)
+        audio, sr = self._prep(audio, sr)
+        self.sd.play(audio, samplerate=sr, blocking=False, device=self._out_device)
         self._play_end = time.monotonic() + len(audio) / sr
 
     def stop_playback(self):
@@ -255,6 +280,7 @@ class WakeGatedCapture:
                  threshold: float = 0.02,
                  silence_ms: int = 700,
                  min_utterance_ms: int = 250,
+                 min_voiced_ms: int = 200,
                  max_wait_s: float = 2.5,
                  conversation_timeout: float = 6.0,
                  max_phrase_s: float = 8.0,
@@ -271,6 +297,10 @@ class WakeGatedCapture:
         self.verbose = verbose
         self.silence_ms = silence_ms
         self.min_utterance_ms = min_utterance_ms
+        # A capture must contain at least this much audio ABOVE the threshold
+        # (real sound, not just a single spike) to count as a real utterance.
+        # Otherwise it's dropped without bothering the LM.
+        self.min_voiced_ms = min_voiced_ms
         self.max_wait_s = max_wait_s
         self.conversation_timeout = conversation_timeout
         self.max_phrase_s = max_phrase_s
@@ -333,6 +363,24 @@ class WakeGatedCapture:
     def _drain(self) -> None:
         while self.backend.read_chunk() is not None:
             pass
+
+    def _run_animation(self, fn) -> None:
+        """Run a wake/sleep animation that may play a sound. Pause the mic
+        stream around it so full-duplex playback on Reachy can't wedge/block the
+        audio device, then restart the stream fresh."""
+        try:
+            self.backend.stop_recording()
+        except Exception as e:
+            print(f"[wake] stop_recording avant animation: {e}")
+        try:
+            fn()
+        except Exception as e:
+            print(f"[wake] animation a échoué: {e}")
+        finally:
+            try:
+                self.backend.start_recording()
+            except Exception as e:
+                print(f"[wake] start_recording après animation: {e}")
 
     def utterances(self) -> Iterator[np.ndarray]:
         self.backend.start_recording()
@@ -399,11 +447,13 @@ class WakeGatedCapture:
                             self._save_clip("misses", score)
                             print("[wake-rec] raté enregistré (flag utilisateur)")
 
-                # Wake animation (may play a sound) — fire it, then drain the
-                # buffer so we don't capture the animation noise.
+                # Wake animation (may play a sound). On Reachy, playing audio
+                # while the mic stream is live can wedge/block the audio device
+                # (full-duplex contention), so pause recording around it and
+                # restart the stream fresh afterwards. Then drain the buffer so
+                # we don't capture the animation noise.
                 if self.on_wake:
-                    try: self.on_wake()
-                    except Exception: pass
+                    self._run_animation(self.on_wake)
                 self._drain()
                 if self.on_state:
                     self.on_state("awake")
@@ -437,8 +487,7 @@ class WakeGatedCapture:
 
                 # ---- Back to sleep ----------------------------------------
                 if self.on_sleep:
-                    try: self.on_sleep()
-                    except Exception: pass
+                    self._run_animation(self.on_sleep)
                 self._drain()
                 if self.on_state:
                     self.on_state("asleep")
@@ -449,6 +498,7 @@ class WakeGatedCapture:
         frames: list[np.ndarray] = []
         started = False
         silent_ms = 0.0
+        voiced_ms = 0.0          # total audio above the threshold (real sound)
         t_start = time.monotonic()
 
         while True:
@@ -471,24 +521,34 @@ class WakeGatedCapture:
                 try: self.on_rms(rms)
                 except Exception: pass
 
+            chunk_ms = len(chunk) * 1000 / sr
             if not started:
                 if rms > self.threshold:
                     started = True
                     frames.append(chunk)
+                    voiced_ms += chunk_ms
                 elif time.monotonic() - t_start > max_wait_s:
                     return None     # nobody spoke within the wait window
             else:
                 frames.append(chunk)
                 if rms > self.threshold:
                     silent_ms = 0.0
+                    voiced_ms += chunk_ms
                 else:
-                    silent_ms += len(chunk) * 1000 / sr
+                    silent_ms += chunk_ms
                     if silent_ms > self.silence_ms:
                         break
                 if (sum(len(f) for f in frames) / sr) > self.max_phrase_s:
                     break
 
         if not frames:
+            return None
+        # Gate: too little actual sound (a click, a cough, faint noise) → drop
+        # it instead of wasting an LM call on "(inintelligible)".
+        if voiced_ms < self.min_voiced_ms:
+            if self.verbose:
+                print(f"[wake] 🤫 trop peu de son ({voiced_ms:.0f}ms < "
+                      f"{self.min_voiced_ms}ms) → ignoré")
             return None
         utt = np.concatenate(frames)
         return _resample_mono(utt, sr, SAMPLE_RATE)

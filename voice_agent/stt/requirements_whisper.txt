@@ -1,0 +1,4 @@
+# STT stage of the cascade pipeline (.venv_whisper). Apple Silicon only.
+mlx-whisper
+numpy
+soundfile

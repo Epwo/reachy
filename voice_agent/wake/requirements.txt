@@ -5,3 +5,4 @@ onnxruntime
 numpy
 sounddevice
 soundfile
+scikit-learn        # train_verifier.py — custom verifier (logistic regression)

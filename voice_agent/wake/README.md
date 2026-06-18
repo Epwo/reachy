@@ -76,12 +76,14 @@ prononcé par différentes voix TTS) puis entraîne un petit classifieur.
    fichier **`bilou.onnx`**.
 
 4. Télécharge-le et place-le ici :
+
    ```
    voice_agent/wake/models/bilou.onnx
    voice_agent/wake/models/reachy.onnx
    ```
 
 5. Utilise-le :
+
    ```bash
    python wake/wake_word.py --model wake/models/bilou.onnx --threshold 0.5
    ```
@@ -93,6 +95,90 @@ prononcé par différentes voix TTS) puis entraîne un petit classifieur.
 > Astuce : commence par valider tout le flux avec `hey_jarvis`. Une fois que
 > le comportement te plaît (seuil, capture de phrase), entraîne tes mots et
 > remplace juste `--model`.
+
+## Améliorer la détection avec un verifier custom (quelques minutes)
+
+Le modèle de base `.onnx` est entraîné sur des voix synthétiques génériques.
+Pour l'adapter à **ta** voix et réduire les faux déclenchements, openWakeWord
+permet d'ajouter un petit **verifier** de second étage : quand le modèle de
+base se déclenche, le verifier vérifie le clip contre ton profil vocal.
+
+C'est une régression logistique sur les embeddings audio — ça s'entraîne en
+quelques secondes, ne demande que `scikit-learn` (pas de GPU, pas de torch),
+et ça **réduit les faux positifs** tout en **améliorant la détection de ta
+voix**. Tu réutilises directement les clips que l'agent enregistre à l'usage.
+
+### 1. Collecter des clips en utilisant l'agent
+
+Lance l'agent avec `--record-wake DIR` et sers-t'en normalement. Chaque
+détection est sauvegardée, et tu peux signaler les ratés depuis le web UI
+(bouton « raté » → le clip part dans `misses/`).
+
+```bash
+python ../agent.py --no-robot --wake wake/models/billou.onnx \
+    --record-wake ~/reachy_wake_data --webui
+```
+
+Les clips atterrissent dans :
+
+```
+~/reachy_wake_data/detections/   le mot a déclenché (vrai ? ou faux positif ?)
+~/reachy_wake_data/nearmiss/     score proche du seuil mais pas déclenché
+~/reachy_wake_data/misses/       tu as cliqué « raté » dans le web UI
+```
+
+### 2. Labelliser les clips (positif / négatif)
+
+```bash
+source ../.venv_wake/bin/activate
+
+# Interactif : joue chaque clip, tu tapes p (c'est le mot) / n (faux/bruit)
+python wake/label_recordings.py /Users/ewann/reachy_wake_data
+
+# Juste voir les compteurs
+python wake/label_recordings.py /Users/ewann/reachy_wake_data --stats
+```
+
+- **positif** = c'est bien toi qui dis « billou »
+- **négatif** = faux déclenchement, bruit, autre parole
+
+Vise ~10+ de chaque pour un bon verifier (ça marche dès 3, en moins bien).
+
+### 3. Exporter les jeux d'entraînement
+
+```bash
+python wake/label_recordings.py /Users/ewann/reachy_wake_data --export
+```
+
+Ça construit deux dossiers plats :
+
+```
+~/reachy_wake_data/_train_positive/
+~/reachy_wake_data/_train_negative/
+```
+
+### 4. Entraîner le verifier (~secondes)
+
+```bash
+python wake/train_verifier.py /Users/ewann/reachy_wake_data
+# → wake/models/billou_verifier.joblib
+
+# Pour un autre modèle de base :
+python wake/train_verifier.py ~/reachy_wake_data --model models/reachy.onnx
+```
+
+### 5. L'utiliser
+
+Passe le `.joblib` à l'agent avec `--wake-verifier` (en plus de `--wake`) :
+
+```bash
+python ../agent.py --no-robot --wake wake/models/billou.onnx \
+    --wake-verifier wake/models/billou_verifier.joblib --webui
+```
+
+> Boucle d'amélioration : continue de tourner avec `--record-wake`, signale les
+> ratés, re-labellise les nouveaux clips, ré-exporte et ré-entraîne. Le verifier
+> s'affine à chaque passe sans jamais retoucher le modèle `.onnx` de base.
 
 ## Brancher sur la pipeline (FAIT)
 
@@ -126,7 +212,9 @@ uv pip install openwakeword
 ```
 wake/
 ├── README.md
-├── requirements.txt    deps pour .venv_wake (openwakeword + onnxruntime)
-├── wake_word.py        prototype de détection + capture
-└── models/             (tes .onnx custom une fois entraînés)
+├── requirements.txt        deps pour .venv_wake (openwakeword + onnxruntime + scikit-learn)
+├── wake_word.py            prototype de détection + capture
+├── label_recordings.py     labelliser/exporter les clips enregistrés (--record-wake)
+├── train_verifier.py       entraîner le verifier custom (logistic regression)
+└── models/                 tes .onnx custom + les *_verifier.joblib
 ```

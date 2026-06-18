@@ -38,6 +38,7 @@ class ToolResult:
     animation: Optional[str] = None  # optional robot animation name to play
     timer_seconds: Optional[float] = None  # schedule a background timer
     timer_label: str = ""                  # spoken label for the timer
+    capture_image: bool = False  # grab a camera frame + re-ask the VLM (vision)
 
 
 @dataclass
@@ -83,17 +84,15 @@ def tools_system_prompt() -> str:
         "",
         "RÈGLES DE FORMAT (très important) :",
         "- Ta phrase parlée va sur sa PROPRE ligne.",
-        "- La ligne [tool:...] va sur une ligne SÉPARÉE, en DERNIER.",
+        "- La ligne [tool:...] va sur une ligne SÉPARÉE, après ta réponse.",
         "- Ne mets JAMAIS de phrase parlée après [tool:nom] sur la même ligne.",
         "- Pour [tool:search], l'argument est UNIQUEMENT la requête de recherche.",
         "",
         "Exemple correct (on te demande de dormir) :",
-        "  [heard] tu peux aller dormir",
         "  D'accord, à bientôt !",
         "  [tool:sleep]",
         "",
         "Exemple correct (question d'actualité) :",
-        "  [heard] quelle est la météo à Paris demain",
         "  Je vérifie ça tout de suite.",
         "  [tool:search] météo Paris demain",
         "",
@@ -145,7 +144,26 @@ def _search(args: str, ctx: dict) -> ToolResult:
         "À partir de ces infos, réponds à l'utilisateur en français, "
         "en 1 ou 2 phrases courtes et naturelles."
     )
-    return ToolResult(followup=txt, note=f"search:{query}")
+    # Note = compact log line (sources), NOT fed to the model.
+    domains = []
+    for r in results:
+        u = r.get("url", "")
+        m = re.search(r"https?://([^/]+)", u)
+        domains.append(m.group(1) if m else u)
+    note = f"search «{query}» → {len(results)} résultats : " + ", ".join(domains)
+    return ToolResult(followup=txt, note=note)
+
+
+@tool(
+    "vision",
+    "[tool:vision] — quand on te demande ce que tu VOIS, de regarder quelque "
+    "chose, de décrire ce qui est devant toi, une couleur, un objet, ou qui est "
+    "là. Tu as une caméra mais tu n'as PAS ENCORE regardé : ne décris donc RIEN, "
+    "n'invente AUCUN objet. Mets juste [tool:vision] sur sa propre ligne (tu peux "
+    "ajouter au plus « Attends, je regarde. » avant). Tu décriras après avoir vu.",
+)
+def _vision(args: str, ctx: dict) -> ToolResult:
+    return ToolResult(capture_image=True, note="vision")
 
 
 @tool(
