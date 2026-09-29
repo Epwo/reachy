@@ -1,232 +1,163 @@
-# Reachy voice agent — local pipeline on Apple Silicon
+# Reachy voice agent — local French assistant on Apple Silicon
 
 ```
-mic → VAD → Gemma 4 (audio→text) → Kokoro TTS (text→audio) → speaker
-       └─── .venv_lm ─────────┘   └────── .venv_kokoro ─────┘
+"Billou" ─► openWakeWord ─► Whisper large-v3-turbo ─► Qwen3.5-4B (VLM) ─► Supertonic 3 ─► 🔊
+ wake word    + verifier       speech → French text    reply + [tool:…]     text → speech
+                                  .venv_whisper           .venv_lm         .venv_supertonic
 ```
 
-Two MLX models in separate venvs (their `mlx` pins conflict; can't share
-an environment). The orchestrator (`agent.py`) keeps both as long-lived
-subprocesses with models loaded — first turn includes the LM/TTS warmup
-(~30 s total), subsequent turns are real-time (sub-2 s on M4 base).
+Everything runs on-device on a Mac mini M4 (12 GB). `agent.py` keeps the three
+models loaded as long-lived subprocesses (one venv each, because their MLX pins
+conflict) and talks to them with JSON over pipes. Why these models and not
+others: see [MODELES_TESTES.md](MODELES_TESTES.md).
 
-The pipeline ships with Kokoro-82M (RTF ~0.1) by default. An optional
-Kyutai-1.6B engine is kept around for quality comparison via `test_tts.py
---engine kyutai`; it lives in `.venv_tts` and isn't wired into the
-default pipeline because it runs slower than realtime on M4 base.
+What Bilou can do:
 
-## Files
+- **Wake word** "Billou", with a custom verifier trained on your own voice → [wake/README.md](wake/README.md)
+- **Conversation mode**: stays awake for follow-ups (no wake word) until 6 s of silence
+- **Barge-in**: talk over him and he stops to listen
+- **Tools** the LM calls with `[tool:name] args` lines:
 
-```
-voice_agent/
-├── README.md
-├── agent.py                  orchestrator — spawns both workers, shuttles audio
-├── audio_io.py               shared: VAD capture, Reachy/Laptop backends
-│
-├── lm/                       step 1 — audio → text
-│   ├── requirements.txt        deps for .venv_lm (mlx-vlm + Gemma 4)
-│   ├── audio_lm.py             Gemma 4 wrapper, used by lm_server
-│   ├── lm_server.py            long-lived worker, runs in .venv_lm
-│   └── test_audio_lm.py        standalone tester
-│
-├── tts/                      step 2 — text → audio
-│   ├── requirements_kokoro.txt    deps for .venv_kokoro (default TTS, fast)
-│   ├── requirements_kyutai.txt    deps for .venv_tts (alternative, expressive)
-│   ├── tts_kokoro.py              Kokoro wrapper (active engine)
-│   ├── tts_kyutai.py              Kyutai wrapper (for A/B comparison)
-│   ├── tts_server.py              long-lived worker, runs in .venv_kokoro
-│   └── test_tts.py                standalone tester (interactive, --engine flag)
-│
-└── (venvs live at this root: .venv_lm/ .venv_kokoro/ .venv_tts/)
-```
+  | Tool | What happens |
+  |---|---|
+  | `sleep` | goes back to sleep, ends the conversation |
+  | `search` | web search (free DuckDuckGo, or Brave if `BRAVE_API_KEY` is set), then a 2nd LM pass speaks the answer |
+  | `vision` | grabs a camera frame and re-asks the VLM with the image |
+  | `timer` | background timer, announced out loud when it fires |
+  | `emote`, `look`, `nod`, `shake`, `dance` | head/antenna body language, played *while* he speaks ([animations.py](animations.py)) |
+
+- **Web UI** (`--webui`): mic meter, transcripts, mic picker, type-to-speak, "missed wake word" button
+- **Metrics**: one JSON line per turn in `logs/metrics.jsonl`, summarized by `stats.py`
 
 ## Setup
 
 ```bash
 cd voice_agent
 
-# .venv_lm: audio → text (Gemma 4)
-uv venv .venv_lm
-source .venv_lm/bin/activate
-uv pip install -r lm/requirements.txt
-huggingface-cli download mlx-community/gemma-4-e2b-it-4bit    # ~3 GB
-deactivate
+# Main venv: agent.py + TTS worker + wake word
+uv venv .venv_supertonic --python 3.12
+uv pip install --python .venv_supertonic/bin/python -r requirements.txt
+.venv_supertonic/bin/python -c "import openwakeword; openwakeword.utils.download_models()"
 
-# .venv_kokoro: text → audio (default TTS)
-uv venv .venv_kokoro
-source .venv_kokoro/bin/activate
-uv pip install -r tts/requirements_kokoro.txt
-huggingface-cli download mlx-community/Kokoro-82M-bf16        # ~330 MB
-deactivate
+# STT worker (Whisper)
+uv venv .venv_whisper --python 3.12
+uv pip install --python .venv_whisper/bin/python -r stt/requirements.txt
 
-# .venv_tts: alternative TTS for comparison (Kyutai 1.6B) — OPTIONAL
-uv venv .venv_tts
-source .venv_tts/bin/activate
-uv pip install -r tts/requirements_kyutai.txt
-huggingface-cli download kyutai/tts-1.6b-en_fr                # ~4 GB
-huggingface-cli download kyutai/tts-voices
-deactivate
+# Chat LM worker (Qwen3.5-4B VLM)
+uv venv .venv_lm --python 3.12
+uv pip install --python .venv_lm/bin/python -r lm/requirements.txt
+
+# Optional — wake-word tooling (threshold meter, labeling, verifier training)
+uv venv .venv_wake --python 3.13
+uv pip install --python .venv_wake/bin/python -r wake/requirements.txt
 ```
 
-Total disk: ~3.5 GB for the default pipeline (Gemma + Kokoro), plus ~4 GB
-extra if you also want to A/B test Kyutai.
+Model weights download from Hugging Face on first launch (~1.5 GB Whisper,
+~2.9 GB Qwen3.5-4B, plus Supertonic). The first start takes a while; after
+that each worker loads and warms up in ~10–30 s.
 
-## Test each step on its own
-
-### Step 1 — audio → text (Gemma 4)
+## Run
 
 ```bash
-source .venv_lm/bin/activate
-python lm/test_audio_lm.py --live              # mic → text
-python lm/test_audio_lm.py --audio file.wav    # file → text
-deactivate
+./launch.sh                      # my usual setup (see below), extra flags pass through
+./launch.sh --output-device 1
 ```
 
-### Step 2 — text → audio (Kokoro / Kyutai)
-
-Two ways to test. **Kokoro** (default, fast):
+or by hand:
 
 ```bash
-source .venv_kokoro/bin/activate
-python tts/test_tts.py "Bonjour, je suis Reachy Mini." --engine kokoro
-python tts/test_tts.py "Bonjour" --out /tmp/hello.wav --engine kokoro
-python tts/test_tts.py "Bonjour" --reachy --engine kokoro
-deactivate
+.venv_supertonic/bin/python agent.py --wake wake/models/billou.onnx \
+    --wake-verifier wake/models/billou_verifier.joblib --webui [mode flags]
 ```
 
-**Kyutai** (more expressive, slower, optional):
+### Audio modes
+
+| Mode | Flags | Mic / speaker | Robot | Camera for `vision` |
+|---|---|---|---|---|
+| Full robot | *(none)* | Reachy's (hardware echo cancel — best barge-in) | wakes/sleeps with sound, moves | yes, via `mini.media` |
+| Hybrid | `--no-robot --motion` | Mac's | moves, silent animations | only with `--camera-index N` |
+| Laptop only | `--no-robot` | Mac's | not connected | only with `--camera-index N` |
+
+`launch.sh` uses the hybrid mode.
+
+### Useful flags
+
+| Flag | Default | Use it when… |
+|---|---|---|
+| `--wake-threshold` | 0.5 | it wakes on noise (raise) or misses you (lower) |
+| `--vad-threshold` | 0.02 | he never goes back to sleep (raise) or misses quiet speech (lower) |
+| `--conversation-timeout` | 6 | you want a longer/shorter follow-up window |
+| `--barge-threshold` / `--barge-echo-gain` | 0.05 / 0.6 | his own voice interrupts him (raise both), or he's hard to interrupt |
+| `--no-barge` | | you'd rather he never gets interrupted |
+| `--output-device N` | system default | playback freezes or errors on the Reachy USB audio device (use the Mac speakers' index) |
+| `--camera-index N` | | vision in hybrid/laptop mode (Reachy camera as a USB webcam; needs macOS camera permission for your terminal) |
+| `--record-wake DIR` | | collecting clips to retrain the wake-word verifier |
+| `--save-audio DIR` | | keeping every utterance as WAV + JSON |
+| `--metrics-log FILE` / `--no-metrics` | `logs/metrics.jsonl` | |
+| `--no-tools` | | plain chat, no actions |
+
+List audio devices: `.venv_supertonic/bin/python -c "import sounddevice as sd; print(sd.query_devices())"`
+
+## Metrics
 
 ```bash
-source .venv_tts/bin/activate
-python tts/test_tts.py "Bonjour" --engine kyutai --quantize 8
-deactivate
+.venv_supertonic/bin/python stats.py             # all turns
+.venv_supertonic/bin/python stats.py --last 50
 ```
 
-**Interactive**, when you want to iterate on phrases / voices and watch
-the timings:
+Prints mean / median / p90 / min / max for time to understand (`stt_ms`), to
+think (`lm_ms`, plus `lm2_ms` for the vision/search 2nd pass), to synthesize
+(`tts_ms`), the total latency before he starts talking (`response_ms`), and tool
+usage. The raw JSONL is easy to load in pandas for anything else.
+
+## Test a single stage
 
 ```bash
-source .venv_kokoro/bin/activate
-python tts/test_tts.py --engine kokoro
+.venv_lm/bin/python lm/test_chat_lm.py                        # chat REPL with the LM
+.venv_lm/bin/python lm/test_chat_lm.py --text "Salut Bilou !"
+.venv_wake/bin/python wake/wake_word.py --model wake/models/billou.onnx --meter   # live wake score
 ```
 
-Inside the prompt:
+## Memory budget (12 GB)
+
+| Component | Approx. RAM |
+|---|---|
+| Qwen3.5-4B 4-bit (`.venv_lm`) | ~3 GB |
+| Whisper large-v3-turbo (`.venv_whisper`) | ~1.6 GB |
+| Supertonic 3 + wake word (`.venv_supertonic`) | ~0.6 GB |
+| Python/MLX runtime, 3 processes | ~1.5 GB |
+| macOS + background apps | ~3–4 GB |
+
+## Troubleshooting
+
+- **Freezes right after he speaks** — mic and speaker on the same Reachy USB
+  audio device; the agent prints a ⚠ at startup when that's the case. Use
+  `--output-device` with another device, or headphones.
+- **"Camera is not initialized"** — you're in hybrid/laptop mode (Reachy media
+  off). Use full-robot mode or `--camera-index 0`.
+- **LM worker fails to import `transformers`** — `huggingface-hub` got
+  downgraded by another install:
+  `uv pip install --python .venv_lm/bin/python -U "huggingface-hub>=1.5.0,<2.0"`.
+- **Barge-in on the Mac mic is approximate** — there's no real echo
+  cancellation, only "mic level minus a fraction of his own level". Tune the
+  barge flags, use Reachy's mic, or headphones.
+
+## Files
 
 ```
-> Bonjour, comment vas-tu ?
-  [gen 1.82 s | audio 2.04 s | RTF 0.89]
-
-> :voice expresso/ex04-ex01_default_001_channel1_334s.wav
-voice set: expresso/ex04-ex01_default_001_channel1_334s.wav
-
-> :voices
-12 voice(s) downloaded:
-  expresso/ex01-ex01_default_001_channel1_334s.wav
-  expresso/ex03-ex01_happy_001_channel1_334s.wav
-  siwis/...
-  ...
-Suggested starting points:
-  expresso/ex03-...    (English, happy male)
-  ...
-
-> :save /tmp/sample.wav
-next utterance will be saved to: /tmp/sample.wav
-
-> Salut.
-  [gen 0.91 s | audio 0.83 s | RTF 1.10]
-  wrote → /tmp/sample.wav
-
-> :quit
+voice_agent/
+├── agent.py            orchestrator: workers, turn loop, tools, barge-in, metrics
+├── audio_io.py         Reachy/laptop audio backends, VAD + wake-gated capture
+├── wake_detector.py    openWakeWord wrapper (+ custom verifier)
+├── tools.py            tool registry + implementations
+├── animations.py       head/antenna motions for the body-language tools
+├── webui.py            FastAPI web UI (+ webui_index.html)
+├── stats.py            metrics summary
+├── launch.sh           my usual launch command
+├── requirements.txt    main venv (.venv_supertonic)
+├── stt/                Whisper worker (.venv_whisper)
+├── lm/                 chat-LM worker + REPL tester (.venv_lm)
+├── tts/                Supertonic worker (.venv_supertonic)
+├── wake/               wake-word models, verifier training, labeling tools
+└── logs/               metrics.jsonl (gitignored)
 ```
-
-The first generation in any process pays a ~10–15 s MLX kernel warmup —
-the script does one warmup call automatically before the prompt opens so
-the first timing you see is the real steady-state.
-
-## Run the full pipeline
-
-```bash
-cd voice_agent
-source .venv_kokoro/bin/activate
-python agent.py --no-robot              # laptop mic + speaker
-# or
-python agent.py                         # Reachy mic + speaker
-```
-
-On startup the orchestrator spawns both workers in their respective venvs
-and waits for both to report ready (each loads + warms its model — about
-30 s total on M4 base). Then it listens; speak in French and the robot
-replies in French.
-
-## Tools (function calling)
-
-The model can trigger actions by emitting `[tool:name] args` lines in its
-reply. The agent parses them, runs the tool, and (for tools that fetch
-information, like web search) does a 2nd LM pass to speak a natural answer.
-Tools are on by default; disable with `--no-tools`.
-
-Implemented:
-
-- **`sleep`** — "va dormir / tais-toi" → robot goes back to sleep (ends the
-  wake-conversation).
-- **`search`** — web search. Default backend is **DuckDuckGo** via the free
-  `ddgs` package (no API key, no signup):
-  ```bash
-  source .venv_supertonic/bin/activate
-  uv pip install -r requirements_tools.txt   # installs ddgs
-  python agent.py --wake wake/models/billou.onnx
-  ```
-  Optionally, set `BRAVE_API_KEY` to use the Brave Search API instead (higher
-  quality, but the free tier needs a verified account). DuckDuckGo needs
-  nothing.
-
-Placeholders (acknowledged but not yet wired to motion — edit `tools.py`):
-`emote`, `look`, `nod`, `shake`, `dance`.
-
-Add a tool = one `@tool(...)` function in [`tools.py`](tools.py); its
-description is shown to the model automatically.
-
-## Memory budget on a 12 GB Mac
-
-| Component                         | Approx RAM   |
-| --------------------------------- | ------------ |
-| Gemma 4 E2B (bf16, in .venv_lm)   | ~3 GB        |
-| Kokoro-82M bf16 (in .venv_kokoro) | ~0.5 GB      |
-| Python + MLX runtime per process  | ~0.5 GB each |
-| macOS + light background apps     | ~3-4 GB      |
-| **Total**                         | **~7-8 GB**  |
-
-Plenty of headroom on 12 GB now. The Kokoro switch is the single
-biggest win for this hardware — it removed ~3 GB of resident weights
-and the ~1.5 RTF that came with Kyutai.
-
-## Barge-in (interrupting while it speaks)
-
-On by default: talk over Reachy and he stops to listen. Detection is
-energy-based with a "poor man's AEC" — the mic level minus a fraction of the
-clip's own level at the current playback position, so his own voice doesn't
-trigger a false stop.
-
-- **Best with Reachy's mic** (`python agent.py` full robot): the ReSpeaker does
-  hardware echo cancellation, so only *your* voice reaches the detector.
-- **Laptop mic near the speaker**: his voice can be louder than yours — tune
-  `--barge-threshold` up and `--barge-echo-gain` toward your real echo level,
-  or wear headphones. Or disable with `--no-barge`.
-
-```bash
-python agent.py --wake wake/models/billou.onnx              # barge-in on
-python agent.py --wake ... --barge-threshold 0.08           # harder to trigger
-python agent.py --wake ... --no-barge                       # off
-```
-
-## Known caveats
-
-- **Barge-in on laptop mic is approximate.** Without true AEC, a speaker close
-  to the mic can self-trigger or be hard to interrupt; see tuning above. Real
-  WebRTC AEC would fix it but adds a dependency.
-- **Kokoro default voice** is `ff_siwis` (Swiss French female). For other
-  voices browse `mlx-community/Kokoro-82M-*` voice files or use
-  `:voice <name>` inside `test_tts.py --engine kokoro` to try them.
-- **Kyutai still around** for A/B testing via `test_tts.py --engine kyutai`.
-  Quantizing it is broken in moshi_mlx 0.3.0 (matmul shape mismatch in
-  cross-attention); stay on `--quantize 0` for bf16 if you want to compare.

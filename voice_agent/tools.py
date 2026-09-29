@@ -1,12 +1,13 @@
 """Tool system for the voice agent.
 
-Gemma emits tool calls as lines like `[tool:name] optional args` inside its
-reply. The agent parses them, runs the matching function, and (for tools that
-return information, e.g. web search) does a second LM pass to turn the result
-into a spoken answer.
+The chat LM emits tool calls as lines like `[tool:name] optional args` inside
+its reply. The agent parses them, runs the matching function, and (for tools
+that return information, e.g. web search or vision) does a second LM pass to
+turn the result into a spoken answer. Motion tools return an `animation` that
+the agent plays via animations.py while Bilou speaks.
 
-This module is imported by the agent process (any TTS venv). It only uses the
-standard library, so it adds no dependencies.
+This module is imported by the agent process (.venv_supertonic). Apart from
+the optional `ddgs` web-search backend it only uses the standard library.
 
 Adding a tool = one `@tool(...)`-decorated function. Its description is shown
 to the model in the system prompt, so write it as an instruction.
@@ -227,40 +228,35 @@ def parse_duration(text: str) -> tuple[Optional[int], str]:
     return total, text.strip()
 
 
-# --- placeholders (à implémenter plus tard) ---------------------------------
+# --- body language (played by animations.py, in parallel with speech) -------
 
 
 @tool(
     "emote",
-    "[tool:emote] <émotion> — exprimer une émotion : happy, sad, "
-    "surprised, curious, thinking.",
+    "[tool:emote] <émotion> — exprimer une émotion avec la tête et les "
+    "antennes : happy, sad, surprised, curious, thinking.",
 )
 def _emote(args: str, ctx: dict) -> ToolResult:
-    # TODO: antennes + micro-mouvements de tête selon l'émotion
     return ToolResult(note=f"emote:{args}", animation=f"emote:{args.strip()}")
 
 
 @tool("look", "[tool:look] <direction> — tourner la tête : left, right, up, down.")
 def _look(args: str, ctx: dict) -> ToolResult:
-    # TODO: goto_target vers la direction
     return ToolResult(note=f"look:{args}", animation=f"look:{args.strip()}")
 
 
 @tool("nod", "[tool:nod] — hocher la tête pour dire oui.")
 def _nod(args: str, ctx: dict) -> ToolResult:
-    # TODO
     return ToolResult(note="nod", animation="nod")
 
 
 @tool("shake", "[tool:shake] — secouer la tête pour dire non.")
 def _shake(args: str, ctx: dict) -> ToolResult:
-    # TODO
     return ToolResult(note="shake", animation="shake")
 
 
 @tool("dance", "[tool:dance] — faire une petite danse rigolote.")
 def _dance(args: str, ctx: dict) -> ToolResult:
-    # TODO
     return ToolResult(note="dance", animation="dance")
 
 

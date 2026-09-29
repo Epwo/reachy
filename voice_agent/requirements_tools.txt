@@ -1,3 +1,0 @@
-# Tool-calling extras — install in whichever venv runs agent.py.
-# Web search backend: DuckDuckGo (free, no API key, no signup).
-ddgs

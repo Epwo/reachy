@@ -12,6 +12,7 @@ reachy_mini_env/
 # Runtime data
 known_faces/
 voice_agent/**/wake_captures/
+voice_agent/logs/
 /tmp_audio/
 
 .env

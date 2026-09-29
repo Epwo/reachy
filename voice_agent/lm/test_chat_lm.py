@@ -1,4 +1,4 @@
-"""Standalone tester for step 2 (text → French reply via Gemma on MLX).
+"""Standalone tester for step 2 (text → French reply via the chat LM on MLX).
 
     # One-shot:
     python test_chat_lm.py --text "Quelle heure est-il ?"

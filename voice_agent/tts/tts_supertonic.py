@@ -4,10 +4,9 @@ Released April 2026, 99M params on ONNX Runtime. Supports 31 languages,
 including French. Voices are speaker-style identifiers (M1-M5 male,
 F3-F5 female) that work across every supported language.
 
-Same interface as tts_kyutai.KyutaiTTS and tts_kokoro.KokoroTTS so the
-rest of the pipeline can swap without changes.
+Used by tts_server.py (the long-lived TTS worker):
 
-    from supertonic_tts import SupertonicTTS
+    from tts_supertonic import SupertonicTTS
     tts = SupertonicTTS(voice="F4", lang="fr")
     audio, sr = tts.synthesize("Bonjour, je suis Reachy.")
 """

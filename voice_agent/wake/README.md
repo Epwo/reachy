@@ -1,16 +1,20 @@
-# Wake-word — réveiller Reachy avec "Bilou" / "Reachy"
+# Wake-word — réveiller Reachy avec "Billou"
 
-Prototype isolé : Reachy n'écoute la pipeline LLM **que** quand il a entendu
-son mot de réveil. Évite qu'il réponde à n'importe quel bruit.
+Reachy n'écoute la pipeline **que** quand il a entendu son mot de réveil.
+Évite qu'il réponde à n'importe quel bruit.
 
 Moteur : [openWakeWord](https://github.com/dscripka/openWakeWord) — petit
 modèle ONNX qui tourne en continu à faible CPU. Pas de cloud, pas de clé API.
+
+Toutes les commandes ci-dessous se lancent depuis `voice_agent/`. Ce dossier a
+son propre venv (`.venv_wake`) pour les outils : score en direct, labellisation,
+entraînement du verifier. L'agent, lui, tourne dans `.venv_supertonic`.
 
 ## Installation
 
 ```bash
 cd voice_agent
-uv venv .venv_wake
+uv venv .venv_wake --python 3.13
 source .venv_wake/bin/activate
 uv pip install -r wake/requirements.txt
 # Télécharge les modèles pré-entraînés (une fois) :
@@ -19,7 +23,7 @@ python -c "import openwakeword; openwakeword.utils.download_models()"
 
 ## Tester tout de suite (modèle pré-entraîné anglais)
 
-Les mots "bilou"/"reachy" ne sont pas pré-entraînés — il faut les entraîner
+Le mot "billou" n'est pas pré-entraîné — il faut l'entraîner
 (voir plus bas). Mais on peut valider tout le pipeline immédiatement avec un
 mot pré-entraîné comme **"Hey Jarvis"** :
 
@@ -59,7 +63,7 @@ python wake/wake_word.py --model hey_jarvis --threshold 0.3
 Lance avec `--meter` et observe le score quand tu parles vs quand il y a du
 bruit ambiant. Choisis un seuil entre les deux.
 
-## Entraîner "Bilou" / "Reachy" (~1h, gratuit)
+## Entraîner "Billou" (~1h, gratuit)
 
 openWakeWord génère des données synthétiques (des milliers d'exemples du mot
 prononcé par différentes voix TTS) puis entraîne un petit classifieur.
@@ -68,32 +72,22 @@ prononcé par différentes voix TTS) puis entraîne un petit classifieur.
    https://github.com/dscripka/openWakeWord
    → `notebooks/automatic_model_training.ipynb` (lien "Open in Colab")
 
-2. Dans le notebook, mets le mot cible, par ex. `target_word = "bilou"`
-   (et un second run pour `"reachy"`). Le français marche : le générateur
-   utilise des voix multilingues.
+2. Dans le notebook, mets le mot cible : `target_word = "billou"`. Le
+   français marche : le générateur utilise des voix multilingues.
 
 3. Lance toutes les cellules (GPU Colab gratuit, ~30–60 min). Ça produit un
-   fichier **`bilou.onnx`**.
+   fichier **`billou.onnx`**.
 
-4. Télécharge-le et place-le ici :
+4. Télécharge-le et place-le dans `voice_agent/wake/models/billou.onnx`.
 
-   ```
-   voice_agent/wake/models/bilou.onnx
-   voice_agent/wake/models/reachy.onnx
-   ```
-
-5. Utilise-le :
+5. Vérifie-le avec le score en direct :
 
    ```bash
-   python wake/wake_word.py --model wake/models/bilou.onnx --threshold 0.5
+   python wake/wake_word.py --model wake/models/billou.onnx --meter
    ```
 
-   Pour écouter les deux mots en même temps, on adaptera le script pour
-   passer plusieurs modèles (`wakeword_models=[bilou, reachy]`) — dis-le
-   moi quand tu auras les .onnx.
-
 > Astuce : commence par valider tout le flux avec `hey_jarvis`. Une fois que
-> le comportement te plaît (seuil, capture de phrase), entraîne tes mots et
+> le comportement te plaît (seuil, capture de phrase), entraîne ton mot et
 > remplace juste `--model`.
 
 ## Améliorer la détection avec un verifier custom (quelques minutes)
@@ -115,11 +109,11 @@ détection est sauvegardée, et tu peux signaler les ratés depuis le web UI
 (bouton « raté » → le clip part dans `misses/`).
 
 ```bash
-python ../agent.py --no-robot --wake wake/models/billou.onnx \
+.venv_supertonic/bin/python agent.py --no-robot --wake wake/models/billou.onnx \
     --record-wake ~/reachy_wake_data --webui
 ```
 
-Les clips atterrissent dans :
+(`./launch.sh` le fait déjà.) Les clips atterrissent dans :
 
 ```
 ~/reachy_wake_data/detections/   le mot a déclenché (vrai ? ou faux positif ?)
@@ -130,7 +124,7 @@ Les clips atterrissent dans :
 ### 2. Labelliser les clips (positif / négatif)
 
 ```bash
-source ../.venv_wake/bin/activate
+source .venv_wake/bin/activate
 
 # Interactif : joue chaque clip, tu tapes p (c'est le mot) / n (faux/bruit)
 python wake/label_recordings.py /Users/ewann/reachy_wake_data
@@ -163,8 +157,8 @@ python wake/label_recordings.py /Users/ewann/reachy_wake_data --export
 python wake/train_verifier.py /Users/ewann/reachy_wake_data
 # → wake/models/billou_verifier.joblib
 
-# Pour un autre modèle de base :
-python wake/train_verifier.py ~/reachy_wake_data --model models/reachy.onnx
+# Pour un autre modèle de base (chemin relatif à wake/) :
+python wake/train_verifier.py ~/reachy_wake_data --model models/autre_mot.onnx
 ```
 
 ### 5. L'utiliser
@@ -172,7 +166,7 @@ python wake/train_verifier.py ~/reachy_wake_data --model models/reachy.onnx
 Passe le `.joblib` à l'agent avec `--wake-verifier` (en plus de `--wake`) :
 
 ```bash
-python ../agent.py --no-robot --wake wake/models/billou.onnx \
+.venv_supertonic/bin/python agent.py --no-robot --wake wake/models/billou.onnx \
     --wake-verifier wake/models/billou_verifier.joblib --webui
 ```
 
@@ -180,31 +174,26 @@ python ../agent.py --no-robot --wake wake/models/billou.onnx \
 > ratés, re-labellise les nouveaux clips, ré-exporte et ré-entraîne. Le verifier
 > s'affine à chaque passe sans jamais retoucher le modèle `.onnx` de base.
 
-## Brancher sur la pipeline (FAIT)
+## Dans l'agent
 
 Le wake-word est intégré dans `agent.py` via `--wake`. Tant que le mot n'est
-pas entendu, le LM et le TTS ne tournent pas. Quand il déclenche, la phrase
-captée part vers Gemma puis le TTS.
+pas entendu, rien d'autre ne tourne. Quand il déclenche, la phrase captée part
+vers Whisper → le LM → le TTS, puis Bilou reste à l'écoute pendant
+`--conversation-timeout` secondes pour les relances.
 
 ```bash
-# Depuis le venv de l'agent (.venv_supertonic par défaut)
-source ../.venv_supertonic/bin/activate
-
-# Une fois par venv : télécharger les modèles de preprocessing openWakeWord
-python -c "import openwakeword; openwakeword.utils.download_models()"
-
 # Lancer l'agent en mode "endormi" jusqu'au mot de réveil
-python ../agent.py --no-robot --wake wake/models/billou.onnx --webui
+.venv_supertonic/bin/python agent.py --no-robot --wake wake/models/billou.onnx --webui
 
 # Régler la sensibilité
-python ../agent.py --no-robot --wake wake/models/billou.onnx --wake-threshold 0.6
+.venv_supertonic/bin/python agent.py --no-robot --wake wake/models/billou.onnx --wake-threshold 0.6
 ```
 
-Pré-requis : `openwakeword` doit être installé dans le venv qui lance
-`agent.py` (pur ONNX, pas de conflit avec Supertonic/Kokoro) :
+`openwakeword` est déjà dans le venv de l'agent (`voice_agent/requirements.txt`) ;
+ses modèles de preprocessing se téléchargent une fois par venv :
 
 ```bash
-uv pip install openwakeword
+.venv_supertonic/bin/python -c "import openwakeword; openwakeword.utils.download_models()"
 ```
 
 ## Fichiers

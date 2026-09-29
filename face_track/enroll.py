@@ -1,4 +1,4 @@
-"""Enroll a face using the Reachy Mini camera.
+"""Enroll (or forget) a face using the Reachy Mini camera.
 
 Press SPACE to capture a sample, Q to finish.
 Move/turn your head slightly between samples for better recognition.
@@ -6,6 +6,7 @@ Move/turn your head slightly between samples for better recognition.
 Usage:
     python enroll.py Alice
     python enroll.py Alice --samples 30
+    python enroll.py Alice --forget     # remove a registered person
 """
 
 import argparse
@@ -20,6 +21,8 @@ def main():
     parser.add_argument("name", help="Name to register the face under")
     parser.add_argument("--samples", type=int, default=20,
                         help="Number of samples to capture (default: 20)")
+    parser.add_argument("--forget", action="store_true",
+                        help="Remove this person from the known faces instead.")
     parser.add_argument("--model", default="buffalo_l",
                         choices=["buffalo_sc", "buffalo_s", "buffalo_l"])
     parser.add_argument("--det-size", type=int, default=640)
@@ -28,6 +31,13 @@ def main():
     tracker = FaceTracker(det_size=(args.det_size, args.det_size),
                           model_name=args.model)
     print(f"Already known: {tracker.known_names}")
+
+    if args.forget:
+        if tracker.forget(args.name):
+            print(f"✓ Forgot '{args.name}'. Known faces: {tracker.known_names}")
+        else:
+            print(f"✗ '{args.name}' was not registered.")
+        return
 
     with ReachyMini() as mini:
         mini.wake_up()

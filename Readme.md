@@ -1,67 +1,58 @@
-# Reachy Mini — vision & voice experiments
+# Reachy Mini — vision & voice
 
-Personal experiments turning a [Reachy Mini](https://huggingface.co/docs/reachy_mini)
-into an interactive desktop robot: it follows faces, recognizes who it's
-looking at, and holds a spoken conversation in French — all running locally
-on an Apple Silicon Mac (M4).
+Turning a [Reachy Mini](https://huggingface.co/docs/reachy_mini) into an
+interactive desktop robot: it follows faces, recognizes who it's looking at,
+and holds a spoken conversation in French — all running locally on a Mac mini
+M4 (12 GB), no cloud.
 
-## Two subsystems
+## `face_track/` — follows you with its head
 
-### `face_track/` — face tracking & recognition
-The head smoothly follows the largest/known face, recognizes enrolled people
-(InsightFace embeddings), and can publish an auto-framed feed as a virtual
-webcam.
+The head smoothly tracks the most relevant face and recognizes enrolled people
+(InsightFace embeddings).
 
 ```bash
 cd face_track
-python enroll.py Alice          # register a face
-python main.py                  # track + recognize on the robot
-python experiment.py --webcam 0 # tune tracking params live
-python virtual_camera.py        # auto-framing virtual webcam
+python enroll.py Ewann          # register a face
+python main.py                  # follow + recognize on the robot
+python experiment.py --webcam 0 # tune tracking live
 ```
 
-### `voice_agent/` — local voice assistant
-Wake word → speech understanding → French reply → speech, fully on-device:
+Details: [`face_track/readme.md`](face_track/readme.md).
+
+## `voice_agent/` — "Billou", the voice assistant
 
 ```
-"Billou" → openWakeWord → Gemma 4 (audio→text) → Supertonic (text→audio) → 🔊
+"Billou" → openWakeWord → Whisper large-v3-turbo → Qwen3.5-4B (VLM) → Supertonic 3 → 🔊
 ```
 
 ```bash
 cd voice_agent
-# See voice_agent/README.md for the full multi-venv setup.
-python agent.py --no-robot --motion --wake wake/models/billou.onnx --webui
+./launch.sh
 ```
 
-Highlights:
-- **Wake word** ("Billou") trained with openWakeWord, so it only listens when called.
-- **Conversation mode**: stays awake for follow-ups without re-saying the wake word.
-- **Robot animations**: wakes up / goes to sleep with head + antenna motion.
-- **Web UI** (`--webui`): live mic meter, transcripts, device picker, type-to-speak.
-- Pluggable TTS (`--tts supertonic|kokoro|kyutai`), each in its own venv.
+- **Wake word** "Billou" (openWakeWord + a verifier trained on my voice)
+- **Conversation mode** — follow-ups without repeating the wake word
+- **Barge-in** — talk over him to interrupt
+- **Tools** — web search, camera vision, timers, sleep, and body language
+  (nod, shake, look, emotes, dance)
+- **Web UI** and per-turn latency **metrics** (`stats.py`)
 
-Full docs: [`voice_agent/README.md`](voice_agent/README.md).
-Model exploration history & rationale: [`voice_agent/MODELES_TESTES.md`](voice_agent/MODELES_TESTES.md).
-
-## Hardware / constraints
-
-- Mac mini **M4 base, 12 GB** unified memory
-- Everything local (no cloud) — model choices are driven by what fits & runs
-  in real time on this hardware. `MODELES_TESTES.md` records what was tried
-  and why each option was kept or dropped.
+Details: [`voice_agent/README.md`](voice_agent/README.md) ·
+wake word training: [`voice_agent/wake/README.md`](voice_agent/wake/README.md) ·
+why these models: [`voice_agent/MODELES_TESTES.md`](voice_agent/MODELES_TESTES.md).
 
 ## Layout
 
 ```
 reachy/
-├── face_track/      face tracking + recognition + virtual camera
-├── voice_agent/     wake word + speech LM + TTS pipeline
-│   ├── lm/          audio→text (Gemma 4, mlx-vlm)
-│   ├── tts/         text→audio (Supertonic / Kokoro / Kyutai)
-│   ├── wake/        wake-word model + trainer notes
-│   └── *.py         orchestrator, audio I/O, web UI
-└── Readme.md
+├── face_track/          face tracking + recognition   (.venv_reachy)
+└── voice_agent/         voice assistant
+    ├── stt/             speech → text, Whisper        (.venv_whisper)
+    ├── lm/              text/image → reply, Qwen3.5   (.venv_lm)
+    ├── tts/             text → speech, Supertonic     (.venv_supertonic, also runs agent.py)
+    └── wake/            wake-word models + training   (.venv_wake)
 ```
 
-Virtualenvs (`.venv_*`) and model weights are gitignored; see each subsystem's
-README for how to recreate them.
+Each venv has its own `requirements.txt` next to the code it runs (separate
+venvs because the MLX builds they pin conflict). Venvs, model weights, known
+faces and logs are gitignored.

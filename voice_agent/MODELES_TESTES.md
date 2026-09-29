@@ -125,13 +125,34 @@ dans leur propre architecture "speech-to-speech assistant".
 
 ## 2. Étape 1 — Audio → Texte (compréhension)
 
-### Whisper (mlx-community/whisper-large-v3-turbo)
+### Whisper (mlx-community/whisper-large-v3-turbo) ⭐ **RETENU (juin 2026)**
 
 - **Modalités** : ASR uniquement, ~10× temps réel sur M4
-- **Pourquoi essayé** : référence de l'ASR, MLX disponible
-- **Verdict** : **fonctionne très bien** mais nécessite un LLM séparé
-  derrière pour le raisonnement. Décision : préférer un modèle multimodal
-  qui fait audio → texte ET raisonne dans la même passe.
+- **Premier verdict (mai)** : fonctionne très bien, mais on a d'abord
+  préféré un audio-LLM (Gemma 4) qui comprend ET répond en une passe.
+- **Pourquoi repris** : l'audio-LLM impose un gros modèle multimodal juste
+  pour transcrire ; en passant à Gemma E2B pour gagner en vitesse, la
+  compréhension s'est effondrée (voir ci-dessous). Découper en cascade
+  STT → LM texte → TTS laisse chaque étape faire son vrai métier.
+- **Mesures** : ~0.8 s par phrase (médiane 817 ms en usage réel), transcription
+  française quasi parfaite. Pas besoin de ffmpeg : on décode avec soundfile
+  et on passe un tableau numpy à mlx-whisper.
+- **Piège** : sur du silence pur, Whisper hallucine des génériques de
+  sous-titres (« Sous-titrage ST' 501 ») — sans conséquence, la VAD n'envoie
+  que de la vraie parole.
+
+### Autres ASR évalués (juin 2026, sur papier)
+
+| Modèle | Verdict |
+|---|---|
+| Voxtral Small 24B | ~14 Go même en 4-bit → ne tient pas en 12 Go |
+| Voxtral Mini 3B | très bon français, ports MLX communautaires — meilleure alternative si Whisper déçoit |
+| Nemotron / Parakeet / Canary (« 80 ms ») | écosystème NVIDIA NeMo/CUDA, Parakeet anglais seulement |
+| Qwen3-ASR | surtout une API (Alibaba), pas de poids MLX locaux mûrs |
+| SenseVoice-Small (FunAudioLLM) | ultra rapide (non autorégressif) mais PyTorch/ONNX, pas MLX ; français un cran sous Whisper |
+| Qwen2.5-Omni 7B | audio-LLM trop gros et orienté EN/ZH |
+| pyannote speaker-diarization-3.1 | **pas un ASR** : diarisation (qui parle quand), aucun texte |
+| VibeVoice (Microsoft) | **pas un ASR** : c'est un TTS long format |
 
 ### Gemma 3n E2B-it (mlx-community/gemma-3n-E2B-it-4bit)
 
@@ -147,10 +168,11 @@ dans leur propre architecture "speech-to-speech assistant".
 - **Statut** : utilisé en intermédiaire avant le passage à E4B.
   Bonne qualité mais déflectif sur les questions ouvertes.
 
-### Gemma 4 E4B-it-4bit (mlx-community/gemma-4-e4b-it-4bit) ✅ **RETENU**
+### Gemma 4 E4B-it-4bit (mlx-community/gemma-4-e4b-it-4bit) — utilisé mai → juin 2026
 
 - **Modalités** : pareil qu'E2B mais 4B paramètres activés
-- **Pourquoi retenu** :
+- **Remplacé** en juin 2026 par la cascade Whisper + LM de chat (section 3).
+- **Pourquoi retenu à l'époque** :
   - ~5 Go en mémoire, tient en 12 Go une fois Kyutai TTS retiré
   - Bien meilleur raisonnement que E2B (réelle conversation, pas que
     "Je suis là, je t'écoute")
@@ -160,6 +182,18 @@ dans leur propre architecture "speech-to-speech assistant".
   - Bug audio MLX-VLM sur Gemma 4 réglé par PR #931 (`mlx-vlm>=0.4.4`)
   - Faux modèle hallucinated par moi (`gemma-4n`) — pas existe ;
     c'était bien `gemma-4` sans le `n`
+
+### Gemma 4 E2B QAT (mlx-community/gemma-4-E2B-it-qat-4bit) — essai vitesse, abandonné
+
+- **Pourquoi essayé** : ~2× plus rapide que E4B pour réduire la latence.
+- **Pourquoi abandonné** : compréhension de la parole nettement moins bonne.
+  E2B et E4B partagent le même encodeur audio (E2B est un sous-réseau
+  MatFormer d'E4B) : c'est le **modèle de langue** qui interprète l'audio,
+  donc un LM plus petit comprend moins bien. C'est ce qui a motivé la cascade.
+- **Streaming aussi abandonné** : pour streamer la réponse vers le TTS il
+  fallait mettre la réponse *avant* la ligne `[heard]`, et Gemma comprenait
+  alors beaucoup moins bien. (Avec la cascade, `[heard]` n'existe plus — le
+  streaming redevient possible, voir « Voies futures ».)
 
 ### Phi-4-Multimodal
 
@@ -180,7 +214,40 @@ dans leur propre architecture "speech-to-speech assistant".
 
 ---
 
-## 3. Étape 2 — Texte → Audio (TTS)
+## 3. Étape 2 — LM de chat (texte + image → réponse)
+
+Depuis la cascade, le LM n'a plus qu'à *écrire* 1–2 phrases (et des lignes
+`[tool:…]`) à partir du texte de Whisper.
+
+### Qwen2.5-3B-Instruct (mlx-community/Qwen2.5-3B-Instruct-4bit) — transition
+
+- Texte seul via `mlx-lm` (pas d'encodeurs audio/vision chargés pour rien).
+- ~1.6 s par réponse, français naturel, garde le contexte. Bien, mais pas de vision.
+
+### Qwen3.5-4B (mlx-community/Qwen3.5-4B-MLX-4bit) ⭐ **RETENU**
+
+- **VLM** (MoE, ~2.9 Go) via `mlx-vlm >= 0.6.3` : chat en français **et** vision,
+  donc Bilou peut décrire ce que voit sa caméra (`[tool:vision]`).
+- Raisonnement (`<think>`) **désactivé par défaut** sur le 4B — indispensable
+  pour la latence ; on passe quand même `enable_thinking=False` et on retire
+  tout bloc `<think>` par sécurité.
+- **Mesures** : ~2.6 s en test isolé, ~6.8 s avec une image ; **médiane 4.3 s en
+  usage réel** (prompt système + doc des outils + historique). C'est l'étape
+  la plus lente du pipeline.
+
+### Autres candidats écartés
+
+| Modèle | Pourquoi pas |
+|---|---|
+| Qwen3-4B (texte) | très bon, MLX officiel, thinking désactivable — mais pas de vision |
+| Ministral 3 3B (Mistral) | probablement le meilleur français idiomatique, mais VLM sans chemin texte `mlx-lm` propre |
+| Gemma 3 4B | VLM aussi, rien de mieux que Qwen3.5 pour nous |
+| Llama 3.1 8B | bon français mais 2× plus lent, connaissances 2023 |
+| SmolLM3 3B | orienté anglais |
+
+---
+
+## 4. Étape 3 — Texte → Audio (TTS)
 
 ### macOS `say` (intégré)
 
@@ -205,7 +272,8 @@ dans leur propre architecture "speech-to-speech assistant".
   - Quantization buggée dans moshi_mlx 0.3.0 (matmul shape mismatch
     dans cross-attention)
   - 3.6 Go en bf16 — combiné à Gemma E4B (5 Go), on était en swap permanent
-- **Conservé** comme alternative A/B (`test_tts.py --engine kyutai`)
+- **Code supprimé** (sept. 2026) : gardé un temps comme alternative A/B,
+  jamais réutilisé.
 
 ### Pocket TTS (kyutai/pocket-tts)
 
@@ -219,8 +287,8 @@ dans leur propre architecture "speech-to-speech assistant".
 - **Modalités** : texte → audio, 8 langues dont français (`ff_siwis`)
 - **Pourquoi essayé** : 82 M paramètres, MLX, ultra-rapide
 - **Mesure** : **RTF ~0.10 sur M4 base** — bien sub-realtime
-- **Statut** : utilisé en TTS par défaut un moment, **conservé comme
-  alternative**
+- **Statut** : utilisé en TTS par défaut un moment, puis remplacé par
+  Supertonic. **Code supprimé** (sept. 2026) pour ne garder qu'un moteur.
 - **Bugs en chemin** : chaîne de dépendances pénible (`mlx-audio` →
   `misaki` → `phonemizer` → `espeak-ng` → `espeakng-loader`).
   Plusieurs `ImportError` consécutifs avant que tout fonctionne.
@@ -259,28 +327,33 @@ dans leur propre architecture "speech-to-speech assistant".
 
 ---
 
-## 4. Architecture finale (à ce stade)
+## 5. Architecture actuelle (sept. 2026)
 
 ```
-mic → VAD → Gemma 4 E4B (audio→texte, .venv_lm)
-        → Supertonic 3 (texte→audio, .venv_supertonic)
-        → speaker
+mot de réveil (openWakeWord + verifier)
+  → Whisper large-v3-turbo  (parole → texte, .venv_whisper)   ~0.8 s
+  → Qwen3.5-4B VLM          (texte/image → réponse, .venv_lm) ~4.3 s
+  → Supertonic 3            (texte → parole, .venv_supertonic) ~0.7 s
+  → haut-parleur
 ```
 
-**Pourquoi ce choix au final** :
-- Gemma 4 E4B = meilleur ratio qualité / mémoire / vitesse pour 12 Go
-- Supertonic 3 = bonne qualité de voix + sub-realtime + dep chain propre
-- Kokoro reste branchable (`--tts kokoro`) si on veut RTF encore plus bas
-- Kyutai reste branchable (`--tts kyutai`) si on veut tester la qualité
+Latence médiane avant que Bilou parle : **~6 s** (mesurée par `stats.py`).
+
+**Pourquoi ce choix** :
+- Whisper = transcription française fiable et rapide, indépendante du LM
+- Qwen3.5-4B = bon français + vision + outils, sans raisonnement coûteux
+- Supertonic 3 = bonne voix, sub-realtime, ONNX (aucun conflit MLX)
 
 ## Voies futures à explorer
 
-| Quand | Modèle à tester |
+| Idée | Pourquoi |
 |---|---|
-| Si M4 Pro / Max disponible | Moshi-MLX pour le "natural" de la conversation full-duplex |
-| Si Qwen3-Omni MLX sort en taille 3B/7B | Replacer Gemma + TTS par un seul modèle |
-| Si on veut une voix française premium | Acheter une voix custom Supertonic ou évaluer Qwen3-TTS |
-| Si tool calling devient prioritaire | Tester Phi-4-Multimodal qui a un meilleur support outils |
+| Streamer la réponse du LM phrase par phrase vers le TTS | le LM est l'étape la plus lente ; sans `[heard]` la cascade n'a plus le problème qui avait fait échouer le streaming avec Gemma |
+| Essayer Qwen3.5-2B pour le chat | si 4.3 s reste trop long et que la qualité suit |
+| Voxtral Mini 3B à la place de Whisper | si la transcription française déçoit |
+| Si M4 Pro / Max disponible | Moshi-MLX pour le naturel du full-duplex |
+| Si un omni-modèle français tient en 12 Go en MLX | remplacer toute la cascade par un seul modèle |
+| Voix française premium | voix custom Supertonic ou Qwen3-TTS |
 
 ## Leçons apprises
 
@@ -303,3 +376,10 @@ mic → VAD → Gemma 4 E4B (audio→texte, .venv_lm)
    J'ai halluciné plusieurs noms (`mlx-community/Qwen3-Omni-7B-Instruct-MLX-4bit`,
    `gemma-4n`) — leçon retenue : `WebSearch` + `WebFetch` la première fois
    qu'on cite un repo précis.
+
+6. **Dans un audio-LLM, c'est le LM qui « comprend ».** Réduire la taille du
+   LM (E4B → E2B) dégrade la compréhension même avec le même encodeur audio.
+   Un ASR dédié + un petit LM texte est plus robuste et plus rapide.
+
+7. **Vérifier la fonction d'un modèle, pas seulement son nom.** pyannote fait
+   de la diarisation, VibeVoice du TTS : aucun des deux ne transcrit.

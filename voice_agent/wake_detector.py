@@ -6,14 +6,13 @@ Wraps openWakeWord and adapts it to the agent's audio plumbing:
   expects
 - returns the peak wake score seen across the complete frames in each feed
 
-Requires `openwakeword` + `onnxruntime` in whatever venv runs the agent.
-Both are pure-ONNX so they coexist with the Supertonic / Kokoro TTS venvs.
+Requires `openwakeword` + `onnxruntime` in the agent's venv (.venv_supertonic).
+Both are pure-ONNX, so they coexist with Supertonic without MLX conflicts.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 

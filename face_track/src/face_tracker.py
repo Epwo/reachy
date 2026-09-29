@@ -7,23 +7,19 @@ Usage:
     result = tracker.process(frame)         # detect + recognize
     mini.look_at_image(result.u, result.v)  # track with the robot
 
-Known faces are persisted to ./known_faces/ as .npy embedding files.
+Known faces are persisted to src/known_faces/ as .npy embedding files.
 """
 
 import json
 import os
 import time
-from collections import deque
 from dataclasses import dataclass, field, asdict, fields
 from typing import Optional
 
 import cv2
 import numpy as np
 from insightface.app import FaceAnalysis
-from reachy_mini.reachy_mini import (
-    INIT_ANTENNAS_JOINT_POSITIONS,
-    SLEEP_ANTENNAS_JOINT_POSITIONS,
-)
+from reachy_mini.reachy_mini import INIT_ANTENNAS_JOINT_POSITIONS
 
 
 KNOWN_FACES_DIR = os.path.join(os.path.dirname(__file__), "known_faces")
@@ -151,51 +147,6 @@ class FaceTracker:
         np.save(os.path.join(KNOWN_FACES_DIR, f"{name}.npy"), self._known[name])
         return True
 
-    def enroll_from_webcam(self, name: str, n_samples: int = 30, camera_index: int = 0) -> bool:
-        """Interactively capture frames from a local webcam to enroll a face.
-
-        Press SPACE to capture a sample, Q to finish early.
-        Returns True if at least one sample was captured.
-        """
-        cap = cv2.VideoCapture(camera_index)
-        if not cap.isOpened():
-            raise RuntimeError(f"Cannot open webcam {camera_index}")
-
-        captured = 0
-        print(f"Enrolling '{name}': press SPACE to capture ({n_samples} needed), Q to finish.")
-        try:
-            while captured < n_samples:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-
-                preview = frame.copy()
-                faces = self._app.get(preview)
-                for f in faces:
-                    x1, y1, x2, y2 = map(int, f.bbox)
-                    cv2.rectangle(preview, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(
-                    preview,
-                    f"Samples: {captured}/{n_samples}  [SPACE=capture  Q=done]",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
-                )
-                cv2.imshow("Enroll", preview)
-
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord(" "):
-                    if self.enroll(name, frame):
-                        captured += 1
-                        print(f"  captured {captured}/{n_samples}")
-                    else:
-                        print("  no face detected, try again")
-                elif key == ord("q"):
-                    break
-        finally:
-            cap.release()
-            cv2.destroyAllWindows()
-
-        return captured > 0
-
     def forget(self, name: str) -> bool:
         """Remove a registered person."""
         path = os.path.join(KNOWN_FACES_DIR, f"{name}.npy")
@@ -314,7 +265,7 @@ class FaceTracker:
         """One iteration of the tracking pipeline.
 
         Pure-ish: takes a frame + state + params, mutates `state` in place,
-        and (if send_commands) sends head/antenna commands to `mini`. Returns
+        and (if send_commands) streams head-pose commands to `mini`. Returns
         a StepResult with the detected face (if any), the rendered display,
         and the target pose that was streamed.
 

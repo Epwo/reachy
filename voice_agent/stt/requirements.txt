@@ -1,0 +1,9 @@
+# STT venv (.venv_whisper) — step 1 of the cascade: speech -> French text.
+#   uv venv .venv_whisper --python 3.12
+#   uv pip install --python .venv_whisper/bin/python -r stt/requirements.txt
+# Apple Silicon only (MLX).
+
+mlx-whisper
+numpy
+scipy          # resampling to 16 kHz (no ffmpeg needed)
+soundfile

@@ -14,10 +14,11 @@ Workflow:
        (positive = real wake word, negative = false trigger / noise)
     3. Export:            python wake/label_recordings.py DIR --export
     4. Train:             python wake/train_verifier.py DIR
-    5. Use it:            python ../agent.py --wake wake/models/billou.onnx \
-                                   --wake-verifier wake/models/billou_verifier.joblib
+    5. Use it:            .venv_supertonic/bin/python agent.py \
+                              --wake wake/models/billou.onnx \
+                              --wake-verifier wake/models/billou_verifier.joblib
 
-Run this in .venv_wake (it has openwakeword + scikit-learn).
+Run this from voice_agent/ in .venv_wake (it has openwakeword + scikit-learn).
 """
 
 from __future__ import annotations
@@ -84,7 +85,7 @@ def main():
     )
     print(f"\n✅ Verifier sauvegardé : {out}")
     print("\nUtilise-le :")
-    print(f"  python ../agent.py --wake {model_path} \\")
+    print(f"  .venv_supertonic/bin/python agent.py --wake {model_path} \\")
     print(f"      --wake-verifier {out} --webui")
 
 

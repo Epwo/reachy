@@ -1,0 +1,28 @@
+# Main venv (.venv_supertonic): runs agent.py AND the TTS worker.
+#   uv venv .venv_supertonic --python 3.12
+#   uv pip install --python .venv_supertonic/bin/python -r requirements.txt
+#   .venv_supertonic/bin/python -c "import openwakeword; openwakeword.utils.download_models()"
+#
+# The STT and chat-LM workers live in their own venvs (stt/, lm/) because they
+# pin newer MLX builds.
+
+# Robot + audio I/O
+reachy-mini>=1.8
+numpy>=2.4
+scipy>=1.17              # resampling
+soundfile>=0.13
+sounddevice>=0.5
+opencv-python>=4.13      # camera frame capture for [tool:vision]
+
+# TTS (tts/tts_server.py)
+supertonic>=1.3
+
+# Wake word + custom verifier (.joblib needs scikit-learn to unpickle)
+openwakeword>=0.6
+onnxruntime>=1.25
+scikit-learn>=1.8
+
+# Tools + web UI
+ddgs>=9.0                # free DuckDuckGo web search
+fastapi>=0.110
+uvicorn[standard]>=0.27

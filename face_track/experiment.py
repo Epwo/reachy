@@ -295,7 +295,7 @@ def main():
 
     if args.load:
         params = TrackingParams.load()
-        print(f"Loaded saved params from tracking_params.json")
+        print("Loaded saved params from tracking_params.json")
     else:
         params = TrackingParams(
             dead_zone=args.dead_zone,

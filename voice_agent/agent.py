@@ -1,23 +1,21 @@
 """Voice agent orchestrator.
 
-Spawns the LM worker (in .venv_lm) and the TTS worker (in .venv_supertonic)
-as long-lived subprocesses, then shuttles audio between them. Each model
-loads once at startup; subsequent turns avoid the multi-second warmup.
+Spawns three long-lived model workers, each in its own venv, and shuttles
+audio/text between them. Each model loads once at startup, so turns skip the
+multi-second warmup.
 
-Audio flow:
+Cascade:
     Reachy or laptop mic
-        → VADCapture (utterances chunked by silence)
-        → temp WAV (16 kHz mono)
-        → lm_server  (Gemma 4)    → text
-        → tts_server (Supertonic) → temp WAV (44.1 kHz mono)
-        → speaker (Reachy or laptop), with VAD muted during playback
+        → WakeGatedCapture / VADCapture   (wake word, utterances cut on silence)
+        → stt_server (Whisper, .venv_whisper)       → French text
+        → lm_server  (Qwen3.5-4B VLM, .venv_lm)     → reply (+ [tool:...] lines)
+        → tts_server (Supertonic, .venv_supertonic) → WAV
+        → speaker (Reachy or laptop), with barge-in
 
-Run from any venv that has numpy + soundfile + sounddevice
-(.venv_supertonic works since it has all three):
+Run from .venv_supertonic (it has the robot, audio and wake-word deps):
     cd voice_agent
-    source .venv_supertonic/bin/activate
-    python agent.py --no-robot         # uses laptop mic + speaker
-    python agent.py                    # uses Reachy mic + speaker
+    ./launch.sh                                         # my usual setup
+    .venv_supertonic/bin/python agent.py --wake wake/models/billou.onnx --webui
 """
 
 from __future__ import annotations
@@ -38,18 +36,18 @@ from typing import Optional
 import numpy as np
 import soundfile as sf
 
+import animations
 from audio_io import LaptopBackend, ReachyBackend, VADCapture, WakeGatedCapture
 import tools as toolkit
 
 
 HERE = Path(__file__).resolve().parent
-# The lm worker now parses [heard]/[reply] itself and forwards them as JSON
-# fields — no extra splitting needed in the orchestrator.
 
 
 # ---------------------------------------------------------------------------
 # Robot wake/sleep animations
 # ---------------------------------------------------------------------------
+
 
 def _robot_wake(mini, silent: bool = False) -> None:
     """Raise the head + neutral antennas. `silent` skips the wake sound so it
@@ -57,8 +55,13 @@ def _robot_wake(mini, silent: bool = False) -> None:
     if silent:
         import numpy as np
         from reachy_mini.reachy_mini import INIT_ANTENNAS_JOINT_POSITIONS
-        mini.goto_target(np.eye(4), antennas=INIT_ANTENNAS_JOINT_POSITIONS,
-                         duration=0.8, method="minjerk")
+
+        mini.goto_target(
+            np.eye(4),
+            antennas=INIT_ANTENNAS_JOINT_POSITIONS,
+            duration=0.8,
+            method="minjerk",
+        )
     else:
         mini.wake_up()
 
@@ -70,13 +73,16 @@ _EMOJI_RE = re.compile(
 
 # Leading "Bilou :" / "Reachy:" / "Bilou -" speaker label the model sometimes
 # prefixes onto its reply. We never want the TTS to say its own name.
-_SPEAKER_RE = re.compile(r"^\s*(?:bilou|reachy(?:\s+mini)?)\s*[:\-–—]\s*", re.IGNORECASE)
+_SPEAKER_RE = re.compile(
+    r"^\s*(?:bilou|reachy(?:\s+mini)?)\s*[:\-–—]\s*", re.IGNORECASE
+)
 
 
 def _save_frame(frame) -> "Optional[str]":
     """Write a BGR numpy frame to a temp JPG (cv2 convention). Returns path."""
     try:
         import cv2
+
         fd, path = tempfile.mkstemp(suffix=".jpg")
         os.close(fd)
         cv2.imwrite(path, frame)
@@ -93,13 +99,14 @@ def _grab_frame(mini, camera_index: "Optional[int]" = None) -> "Optional[str]":
     Two sources:
       * `camera_index` set → open the Reachy camera as a plain USB webcam via
         cv2 (works in ANY audio mode, incl. laptop/hybrid 'no_media' — it's
-        decoupled from the Reachy media/audio stack, like virtual_camera.py).
+        decoupled from the Reachy media/audio stack).
       * else → mini.media.get_frame() (needs full Reachy media initialised, i.e.
         default/local backend, NOT the 'no_media' motion mode).
     Both yield BGR arrays."""
     if camera_index is not None:
         try:
             import cv2
+
             cap = cv2.VideoCapture(camera_index)
             try:
                 ok, frame = cap.read()
@@ -118,8 +125,10 @@ def _grab_frame(mini, camera_index: "Optional[int]" = None) -> "Optional[str]":
     try:
         frame = mini.media.get_frame()
     except Exception as e:
-        print(f"[vision] caméra Reachy indisponible: {e} "
-              f"(astuce: lance avec --camera-index 0 pour utiliser la webcam USB)")
+        print(
+            f"[vision] caméra Reachy indisponible: {e} "
+            f"(astuce: lance avec --camera-index 0 pour utiliser la webcam USB)"
+        )
         return None
     if frame is None:
         return None
@@ -140,10 +149,16 @@ def _robot_sleep(mini, silent: bool = False) -> None:
     """Tuck the head down + fold antennas. `silent` skips the sleep sound."""
     if silent:
         from reachy_mini.reachy_mini import (
-            SLEEP_HEAD_POSE, SLEEP_ANTENNAS_JOINT_POSITIONS,
+            SLEEP_HEAD_POSE,
+            SLEEP_ANTENNAS_JOINT_POSITIONS,
         )
-        mini.goto_target(SLEEP_HEAD_POSE, antennas=SLEEP_ANTENNAS_JOINT_POSITIONS,
-                         duration=1.0, method="minjerk")
+
+        mini.goto_target(
+            SLEEP_HEAD_POSE,
+            antennas=SLEEP_ANTENNAS_JOINT_POSITIONS,
+            duration=1.0,
+            method="minjerk",
+        )
     else:
         mini.goto_sleep()
 
@@ -152,11 +167,17 @@ def _robot_sleep(mini, silent: bool = False) -> None:
 # Long-lived subprocess wrapper
 # ---------------------------------------------------------------------------
 
+
 class Worker:
     """A JSON-over-pipes wrapper around a model subprocess."""
 
-    def __init__(self, venv_dir: Path, script_path: Path, label: str,
-                 script_args: Optional[list[str]] = None):
+    def __init__(
+        self,
+        venv_dir: Path,
+        script_path: Path,
+        label: str,
+        script_args: Optional[list[str]] = None,
+    ):
         py = venv_dir / "bin" / "python"
         if not py.exists():
             raise RuntimeError(
@@ -222,26 +243,28 @@ class Worker:
 # Main loop
 # ---------------------------------------------------------------------------
 
-TTS_ENGINES = {
-    # name        : venv folder name
-    "supertonic" : ".venv_supertonic",
-    "kokoro"     : ".venv_kokoro",
-    "kyutai"     : ".venv_tts",
-}
-
-
-def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
-        save_audio_dir: Optional[Path] = None,
-        wake_model: Optional[str] = None, wake_threshold: float = 0.5,
-        wake_verifier: Optional[str] = None,
-        conversation_timeout: float = 6.0, motion: bool = False,
-        vad_threshold: float = 0.02, min_voiced_ms: int = 200,
-        use_tools: bool = True,
-        barge_enabled: bool = True, barge_threshold: float = 0.05,
-        barge_echo_gain: float = 0.6, barge_min_ms: float = 250.0,
-        record_wake_dir: Optional[Path] = None,
-        output_device: Optional[int] = None,
-        camera_index: Optional[int] = None):
+def run(
+    use_robot: bool,
+    webui: bool,
+    webui_port: int,
+    save_audio_dir: Optional[Path] = None,
+    wake_model: Optional[str] = None,
+    wake_threshold: float = 0.5,
+    wake_verifier: Optional[str] = None,
+    conversation_timeout: float = 6.0,
+    motion: bool = False,
+    vad_threshold: float = 0.02,
+    min_voiced_ms: int = 200,
+    use_tools: bool = True,
+    barge_enabled: bool = True,
+    barge_threshold: float = 0.05,
+    barge_echo_gain: float = 0.6,
+    barge_min_ms: float = 250.0,
+    record_wake_dir: Optional[Path] = None,
+    output_device: Optional[int] = None,
+    camera_index: Optional[int] = None,
+    metrics_path: Optional[Path] = None,
+):
     # We connect to the robot if we use it for audio (ReachyBackend) OR just
     # for movement/animation (--motion with laptop audio = hybrid mode).
     connect_robot = use_robot or motion
@@ -255,6 +278,7 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
     mini = mini_ctx = None
     if connect_robot:
         from reachy_mini import ReachyMini
+
         mini_ctx = ReachyMini(media_backend="no_media") if hybrid else ReachyMini()
         mini = mini_ctx.__enter__()
         if wake_model:
@@ -263,18 +287,15 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
             _robot_wake(mini, silent=hybrid)
 
     # Audio backend: Reachy mic/speaker, or the Mac's default devices.
-    backend = (ReachyBackend(mini) if use_robot
-               else LaptopBackend(output_device=output_device))
+    backend = (
+        ReachyBackend(mini) if use_robot else LaptopBackend(output_device=output_device)
+    )
 
     # Workers — these take 10-30 s to start as each loads + warms its model.
-    # Cascade pipeline: STT (Whisper) → LM (Gemma text) → TTS.
+    # Cascade pipeline: STT (Whisper) → LM (Qwen3.5-4B) → TTS (Supertonic).
     stt = Worker(HERE / ".venv_whisper", HERE / "stt" / "stt_server.py", "stt")
     lm = Worker(HERE / ".venv_lm", HERE / "lm" / "lm_server.py", "lm")
-    tts_venv = HERE / TTS_ENGINES[tts_engine]
-    tts = Worker(
-        tts_venv, HERE / "tts" / "tts_server.py", "tts",
-        script_args=["--engine", tts_engine],
-    )
+    tts = Worker(HERE / ".venv_supertonic", HERE / "tts" / "tts_server.py", "tts")
 
     # Optional web UI — starts a FastAPI server in a daemon thread that
     # shares state with this main loop via `state`.
@@ -285,12 +306,12 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
             from webui import AgentState, start_in_background
         except ModuleNotFoundError as e:
             print(f"[webui] missing dep ({e}). To enable the web UI, run:")
-            print(f"        uv pip install -r requirements_webui.txt")
-            print(f"        (in whichever venv you launched agent.py from)")
-            print(f"[webui] continuing without the web UI...")
+            print("        uv pip install -r requirements.txt")
+            print("        (in whichever venv you launched agent.py from)")
+            print("[webui] continuing without the web UI...")
         else:
             state = AgentState()
-            state.set_tts_engine(tts_engine)
+            state.set_tts_engine("supertonic")
             state.bind_handlers(
                 on_clear_history=lambda: (
                     lm.call({"command": "clear_history"}),
@@ -298,32 +319,38 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
                 ),
                 on_say=lambda text: say_queue.put_nowait(text),
                 on_switch_mic=lambda idx: (
-                    isinstance(backend, LaptopBackend)
-                    and backend.switch_device(idx)
+                    isinstance(backend, LaptopBackend) and backend.switch_device(idx)
                 ),
             )
             start_in_background(state, port=webui_port)
 
     if wake_model:
         from wake_detector import WakeDetector
+
         print(f"[wake] loading wake model: {wake_model} (threshold {wake_threshold})")
-        detector = WakeDetector(wake_model, threshold=wake_threshold,
-                                verifier=wake_verifier)
+        detector = WakeDetector(
+            wake_model, threshold=wake_threshold, verifier=wake_verifier
+        )
 
         def _on_wake():
             print("🔔 RÉVEILLÉ")
             if mini is not None:
-                try: _robot_wake(mini, silent=hybrid)
-                except Exception as e: print(f"[wake] wake anim failed: {e}")
+                try:
+                    _robot_wake(mini, silent=hybrid)
+                except Exception as e:
+                    print(f"[wake] wake anim failed: {e}")
 
         def _on_sleep():
             print("😴 Reachy se rendort")
             if mini is not None:
-                try: _robot_sleep(mini, silent=hybrid)
-                except Exception as e: print(f"[wake] sleep anim failed: {e}")
+                try:
+                    _robot_sleep(mini, silent=hybrid)
+                except Exception as e:
+                    print(f"[wake] sleep anim failed: {e}")
 
         capture = WakeGatedCapture(
-            backend, detector,
+            backend,
+            detector,
             threshold=vad_threshold,
             min_voiced_ms=min_voiced_ms,
             conversation_timeout=conversation_timeout,
@@ -339,8 +366,10 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
             state.set_wake_miss_handler(capture.flag_miss)
         if record_wake_dir is not None:
             print(f"[wake-rec] enregistrement des détections → {record_wake_dir}/")
-        print(f"[wake] Reachy dort. Dis le mot de réveil pour lui parler "
-              f"(conversation continue pendant {conversation_timeout:.0f}s).")
+        print(
+            f"[wake] Reachy dort. Dis le mot de réveil pour lui parler "
+            f"(conversation continue pendant {conversation_timeout:.0f}s)."
+        )
     else:
         capture = VADCapture(
             backend,
@@ -374,8 +403,10 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
                 backend.play(audio, sr)
             finally:
                 if wav and os.path.exists(wav):
-                    try: os.remove(wav)
-                    except OSError: pass
+                    try:
+                        os.remove(wav)
+                    except OSError:
+                        pass
                 time.sleep(0.2)
                 capture._drain()
                 capture.muted = was_muted
@@ -385,6 +416,7 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
             lbl = f" de {label}" if label else ""
             print(f"[timer] ⏰ minuteur{lbl} terminé")
             _announce(f"Ding ding ! Ton minuteur{lbl} est terminé !")
+
         t = threading.Timer(seconds, _fire)
         t.daemon = True
         t.start()
@@ -396,7 +428,7 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
         if interrupted. Uses echo-compensated energy: mic level minus a
         fraction of the clip's own level at the current playback position, so
         the robot's own voice doesn't trigger a false interruption."""
-        win = max(1, int(sr * 0.03))                 # 30 ms RMS window on the clip
+        win = max(1, int(sr * 0.03))  # 30 ms RMS window on the clip
         backend.play_async(audio, sr)
         t_start = time.monotonic()
         # Hard safety cap: never loop longer than the clip itself (+ margin),
@@ -415,7 +447,7 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
             mic_rms = float(np.sqrt(np.mean(chunk * chunk) + 1e-9))
             # Concurrent level of the clip itself (echo we expect to hear).
             pos = int((time.monotonic() - t_start) * sr)
-            seg = audio[max(0, pos - win):pos]
+            seg = audio[max(0, pos - win) : pos]
             clip_rms = float(np.sqrt(np.mean(seg * seg) + 1e-9)) if len(seg) else 0.0
             effective = mic_rms - barge_echo_gain * clip_rms
             if effective > barge_threshold:
@@ -432,44 +464,67 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
         If barge-in is enabled and the user interrupts, playback stops early."""
         nonlocal_wav: Optional[str] = None
         try:
-          with speak_lock:   # serialize vs. background timer announcements
-            if state: state.set_state("speaking")
-            t0 = time.monotonic()
-            resp = tts.call({"text": text})
-            t_tts = time.monotonic() - t0
-            if resp.get("error"):
-                print(f"[tts error] {resp['error']}")
-                return t_tts * 1000, 0.0
-            nonlocal_wav = resp["audio_path"]
-            audio, sr = sf.read(nonlocal_wav, dtype="float32", always_2d=False)
-            if audio.ndim == 2:
-                audio = audio.mean(axis=1)
-            audio_s = len(audio) / sr
-            print(f"[tts {t_tts:.2f}s, {audio_s:.2f}s audio]")
+            with speak_lock:  # serialize vs. background timer announcements
+                if state:
+                    state.set_state("speaking")
+                t0 = time.monotonic()
+                resp = tts.call({"text": text})
+                t_tts = time.monotonic() - t0
+                if resp.get("error"):
+                    print(f"[tts error] {resp['error']}")
+                    return t_tts * 1000, 0.0
+                nonlocal_wav = resp["audio_path"]
+                audio, sr = sf.read(nonlocal_wav, dtype="float32", always_2d=False)
+                if audio.ndim == 2:
+                    audio = audio.mean(axis=1)
+                audio_s = len(audio) / sr
+                print(f"[tts {t_tts:.2f}s, {audio_s:.2f}s audio]")
 
-            do_barge = allow_barge and barge_enabled
-            if do_barge:
-                interrupted = _monitored_play(audio, sr)
-                if interrupted:
-                    print("[barge] ✋ interrompu — j'écoute")
-                    # Don't drain: keep the user's ongoing speech for capture.
+                do_barge = allow_barge and barge_enabled
+                if do_barge:
+                    interrupted = _monitored_play(audio, sr)
+                    if interrupted:
+                        print("[barge] ✋ interrompu — j'écoute")
+                        # Don't drain: keep the user's ongoing speech for capture.
+                    else:
+                        time.sleep(0.3)
+                        capture._drain()
                 else:
-                    time.sleep(0.3)
-                    capture._drain()
-            else:
-                capture.muted = True
-                try:
-                    backend.play(audio, sr)
-                finally:
-                    time.sleep(0.3)
-                    capture._drain()
-                    capture.muted = False
-            return t_tts * 1000, audio_s
+                    capture.muted = True
+                    try:
+                        backend.play(audio, sr)
+                    finally:
+                        time.sleep(0.3)
+                        capture._drain()
+                        capture.muted = False
+                return t_tts * 1000, audio_s
         finally:
             if nonlocal_wav and os.path.exists(nonlocal_wav):
-                try: os.remove(nonlocal_wav)
-                except OSError: pass
-            if state: state.set_state("idle")
+                try:
+                    os.remove(nonlocal_wav)
+                except OSError:
+                    pass
+            if state:
+                state.set_state("idle")
+
+    # Metrics: one JSON line per turn (timings, tools, texts) for offline stats.
+    if metrics_path is not None:
+        try:
+            metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            print(f"[metrics] journal des tours → {metrics_path}")
+        except OSError as e:
+            print(f"[metrics] impossible de créer {metrics_path}: {e}")
+            metrics_path = None
+
+    def _log_metrics(rec: dict) -> None:
+        if metrics_path is None:
+            return
+        rec = {"ts": time.time(), "iso": time.strftime("%Y-%m-%dT%H:%M:%S"), **rec}
+        try:
+            with open(metrics_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except OSError as e:
+            print(f"[metrics] écriture échouée: {e}")
 
     # Tools: docs appended to the system prompt + a context dict tools receive.
     tools_extra = toolkit.tools_system_prompt() if use_tools else ""
@@ -482,6 +537,7 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
         else:
             try:
                 import ddgs  # noqa: F401
+
                 print("[tools] recherche web: DuckDuckGo (gratuit, sans clé)")
             except ImportError:
                 print("[tools] recherche web: indisponible (pip install ddgs)")
@@ -490,27 +546,37 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
         elif mini is not None and not hybrid:
             print("[vision] caméra: flux média Reachy (mini.media.get_frame)")
         else:
-            print("[vision] caméra: indisponible dans ce mode "
-                  "(utilise --camera-index 0, ou lance en mode robot complet)")
+            print(
+                "[vision] caméra: indisponible dans ce mode "
+                "(utilise --camera-index 0, ou lance en mode robot complet)"
+            )
 
     if barge_enabled:
-        print(f"[barge] interruption activée (seuil {barge_threshold:.3f}, "
-              f"écho-gain {barge_echo_gain:.2f}) — parle pour l'interrompre. "
-              f"Idéal avec le micro de Reachy (AEC) ou un casque.")
+        print(
+            f"[barge] interruption activée (seuil {barge_threshold:.3f}, "
+            f"écho-gain {barge_echo_gain:.2f}) — parle pour l'interrompre. "
+            f"Idéal avec le micro de Reachy (AEC) ou un casque."
+        )
         # Barge-in records while playing. If the mic and speaker resolve to the
         # SAME audio device, full-duplex can wedge it (freeze after playback).
         if isinstance(backend, LaptopBackend):
             try:
                 import sounddevice as sd
-                in_dev = backend._device if backend._device is not None else sd.default.device[0]
+
+                in_dev = (
+                    backend._device
+                    if backend._device is not None
+                    else sd.default.device[0]
+                )
                 out_dev = backend._out_device
                 if in_dev == out_dev:
-                    print(f"[barge] ⚠ micro ET haut-parleur sur le même périphérique "
-                          f"(index {in_dev}). Le full-duplex peut bloquer l'audio. "
-                          f"Utilise --output-device <autre index> (ou un casque).")
+                    print(
+                        f"[barge] ⚠ micro ET haut-parleur sur le même périphérique "
+                        f"(index {in_dev}). Le full-duplex peut bloquer l'audio. "
+                        f"Utilise --output-device <autre index> (ou un casque)."
+                    )
             except Exception:
                 pass
-
 
     print("\nReady. Speak in French. Ctrl-C to quit.\n")
     try:
@@ -532,12 +598,15 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
             saved_path: Optional[Path] = None
             if save_audio_dir is not None:
                 ts = time.strftime("%Y%m%d-%H%M%S")
-                saved_path = save_audio_dir / f"{ts}_{int(time.time()*1000)%1000:03d}.wav"
+                saved_path = (
+                    save_audio_dir / f"{ts}_{int(time.time() * 1000) % 1000:03d}.wav"
+                )
                 sf.write(str(saved_path), utterance, 16000, subtype="PCM_16")
 
             try:
                 # Step 1a: audio → text (Whisper STT).
-                if state: state.set_state("thinking")
+                if state:
+                    state.set_state("thinking")
                 t0 = time.monotonic()
                 sr = stt.call({"audio_path": wav_in})
                 t_stt = time.monotonic() - t0
@@ -550,10 +619,15 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
                     # Whisper heard nothing intelligible — skip the LM round-trip.
                     continue
 
-                # Step 1b: text → reply (Gemma, persona + tools).
+                # Step 1b: text → reply (chat LM, persona + tools).
                 t1 = time.monotonic()
-                resp = lm.call({"command": "respond_chat",
-                                "text": heard, "extra_system": tools_extra})
+                resp = lm.call(
+                    {
+                        "command": "respond_chat",
+                        "text": heard,
+                        "extra_system": tools_extra,
+                    }
+                )
                 t_lm = time.monotonic() - t1
                 if resp.get("error"):
                     print(f"[lm error] {resp['error']}")
@@ -572,8 +646,10 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
                         print(f"[tool]    {r.note}")
                     if r.followup:
                         ret = r.followup.replace("\n", " ⏎ ")
-                        print(f"[tool] ←  {ret[:600]}"
-                              + (" …" if len(r.followup) > 600 else ""))
+                        print(
+                            f"[tool] ←  {ret[:600]}"
+                            + (" …" if len(r.followup) > 600 else "")
+                        )
                     elif r.timer_seconds:
                         print(f"[tool] ←  minuteur : {r.timer_seconds:.0f}s")
                     elif not r.note:
@@ -584,6 +660,11 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
                         followups.append(r.followup)
                     if r.timer_seconds:
                         _schedule_timer(r.timer_seconds, r.timer_label)
+                    # Body language: runs in the background, during the reply.
+                    # ("sleep" is played by the wake capture, not here.)
+                    if r.animation and r.animation != "sleep" and mini is not None:
+                        if not animations.play_async(mini, r.animation):
+                            print(f"[anim] inconnue : {r.animation}")
 
                 # Fallback: the model sometimes puts its spoken goodbye as the
                 # argument of an argless tool, e.g. `[tool:sleep] À bientôt !`.
@@ -599,20 +680,29 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
                 if saved_path is not None:
                     meta_path = saved_path.with_suffix(".json")
                     try:
-                        meta_path.write_text(json.dumps({
-                            "wav": saved_path.name,
-                            "duration_s": round(len(utterance) / 16000, 3),
-                            "whisper_heard": heard, "gemma_reply": raw_reply,
-                            "tools": [n for n, _ in tool_calls],
-                            "stt_ms": round(t_stt * 1000, 1),
-                            "lm_ms": round(t_lm * 1000, 1),
-                            "timestamp": time.time(),
-                        }, ensure_ascii=False, indent=2), encoding="utf-8")
+                        meta_path.write_text(
+                            json.dumps(
+                                {
+                                    "wav": saved_path.name,
+                                    "duration_s": round(len(utterance) / 16000, 3),
+                                    "whisper_heard": heard,
+                                    "lm_reply": raw_reply,
+                                    "tools": [n for n, _ in tool_calls],
+                                    "stt_ms": round(t_stt * 1000, 1),
+                                    "lm_ms": round(t_lm * 1000, 1),
+                                    "timestamp": time.time(),
+                                },
+                                ensure_ascii=False,
+                                indent=2,
+                            ),
+                            encoding="utf-8",
+                        )
                     except OSError as e:
                         print(f"[save_audio] failed to write {meta_path}: {e}")
 
                 # Step 2: speak. For search/vision, speak a placeholder first,
                 # then a 2nd LM pass turns the result into the spoken answer.
+                t_lm2 = 0.0  # 2nd-pass LM time (vision/search), 0 if none
                 if want_vision:
                     # Bilou asked to look. Speak a FIXED short filler (not the
                     # first-pass text — without the image the model tends to
@@ -622,27 +712,47 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
                     if frame_path is None:
                         answer = "Je n'arrive pas à voir, ma caméra n'est pas dispo."
                     else:
-                        if state: state.set_state("thinking")
-                        vr = lm.call({"command": "respond_chat", "text": heard,
-                                      "extra_system": tools_extra,
-                                      "image_path": frame_path})
+                        if state:
+                            state.set_state("thinking")
+                        t2 = time.monotonic()
+                        vr = lm.call(
+                            {
+                                "command": "respond_chat",
+                                "text": heard,
+                                "extra_system": tools_extra,
+                                "image_path": frame_path,
+                            }
+                        )
+                        t_lm2 = time.monotonic() - t2
                         raw_v = (vr.get("reply") if not vr.get("error") else None) or ""
-                        _, answer = toolkit.parse_tool_calls(raw_v)  # drop any tool lines
-                        answer = _clean_for_tts(answer) or "Je ne suis pas sûr de ce que je vois."
+                        _, answer = toolkit.parse_tool_calls(
+                            raw_v
+                        )  # drop any tool lines
+                        answer = (
+                            _clean_for_tts(answer)
+                            or "Je ne suis pas sûr de ce que je vois."
+                        )
                         if os.path.exists(frame_path):
-                            try: os.remove(frame_path)
-                            except OSError: pass
+                            try:
+                                os.remove(frame_path)
+                            except OSError:
+                                pass
                     print(f"[vision] {answer}")
                     t_tts_ms, audio_s = _play_text(answer)
                     final_reply = answer
                 elif followups:
                     if spoken:
                         _play_text(spoken)
-                    if state: state.set_state("thinking")
-                    fr = lm.call({"command": "respond_text",
-                                  "text": "\n".join(followups)})
-                    answer = (fr.get("reply") if not fr.get("error") else None) \
-                             or "Désolé, je n'ai rien trouvé."
+                    if state:
+                        state.set_state("thinking")
+                    t2 = time.monotonic()
+                    fr = lm.call(
+                        {"command": "respond_text", "text": "\n".join(followups)}
+                    )
+                    t_lm2 = time.monotonic() - t2
+                    answer = (
+                        fr.get("reply") if not fr.get("error") else None
+                    ) or "Désolé, je n'ai rien trouvé."
                     print(f"[reply+] {answer}")
                     t_tts_ms, audio_s = _play_text(answer)
                     final_reply = answer
@@ -652,18 +762,50 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
 
                 if state:
                     from webui import Turn
-                    state.add_turn(Turn(
-                        heard=heard, reply=final_reply,
-                        lm_ms=t_lm * 1000, tts_ms=t_tts_ms, audio_s=audio_s,
-                    ))
+
+                    state.add_turn(
+                        Turn(
+                            heard=heard,
+                            reply=final_reply,
+                            lm_ms=t_lm * 1000,
+                            tts_ms=t_tts_ms,
+                            audio_s=audio_s,
+                        )
+                    )
+
+                # Per-turn metrics line for offline stats.
+                stt_ms = round(t_stt * 1000, 1)
+                lm_ms = round(t_lm * 1000, 1)
+                lm2_ms = round(t_lm2 * 1000, 1)
+                tts_ms = round(t_tts_ms, 1)
+                # "Time to answer" = from utterance captured to audio ready to play.
+                response_ms = round(stt_ms + lm_ms + lm2_ms + tts_ms, 1)
+                _log_metrics(
+                    {
+                        "heard": heard,
+                        "reply": final_reply,
+                        "tools": [n for n, _ in tool_calls],
+                        "vision": want_vision,
+                        "search": bool(followups),
+                        "utterance_s": round(len(utterance) / 16000, 3),
+                        "stt_ms": stt_ms,  # temps de compréhension (Whisper)
+                        "lm_ms": lm_ms,  # temps de génération (1er passage)
+                        "lm2_ms": lm2_ms,  # 2e passage LM (vision/recherche)
+                        "tts_ms": tts_ms,  # synthèse vocale
+                        "audio_s": round(audio_s, 3),  # durée parlée
+                        "response_ms": response_ms,  # latence totale avant de parler
+                    }
+                )
 
                 # Step 3: sleep tool → end the conversation now.
                 if terminal:
                     if hasattr(capture, "end_conversation"):
                         capture.end_conversation()
                     elif mini is not None:
-                        try: _robot_sleep(mini, silent=hybrid)
-                        except Exception: pass
+                        try:
+                            _robot_sleep(mini, silent=hybrid)
+                        except Exception:
+                            pass
             finally:
                 for p in (wav_in, wav_out):
                     if p and os.path.exists(p):
@@ -675,8 +817,10 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
         print("\nStopping.")
     finally:
         for t in active_timers:
-            try: t.cancel()
-            except Exception: pass
+            try:
+                t.cancel()
+            except Exception:
+                pass
         stt.close()
         lm.close()
         tts.close()
@@ -689,82 +833,156 @@ def run(use_robot: bool, tts_engine: str, webui: bool, webui_port: int,
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--no-robot", action="store_true",
-                        help="Use laptop mic + speaker instead of Reachy.")
-    parser.add_argument("--camera-index", type=int, default=None, metavar="IDX",
-                        help="Open the Reachy camera as a plain USB webcam (cv2) "
-                             "for [tool:vision], decoupled from Reachy media/audio "
-                             "so it works in laptop/--motion modes too. Try 0 "
-                             "first. Without this, vision uses mini.media.get_frame() "
-                             "which needs full Reachy media (not --motion/no_media).")
-    parser.add_argument("--output-device", type=int, default=None, metavar="IDX",
-                        help="sounddevice output index for TTS playback (laptop "
-                             "mode). Default = system default. Use e.g. the "
-                             "'Mac mini Speakers' index to avoid playing 44 kHz "
-                             "TTS on a 16 kHz device. List with: python -c "
-                             "\"import sounddevice as sd; print(sd.query_devices())\"")
-    parser.add_argument("--tts", choices=list(TTS_ENGINES.keys()),
-                        default="supertonic",
-                        help="Which TTS engine to spawn. The corresponding "
-                             "venv must already exist (see README).")
-    parser.add_argument("--webui", action="store_true",
-                        help="Open a small web UI showing mic level, "
-                             "transcripts, controls, and a type-to-speak box.")
-    parser.add_argument("--webui-port", type=int, default=8765,
-                        help="Port for the web UI (default 8765).")
-    parser.add_argument("--save-audio", metavar="DIR",
-                        help="Save every captured utterance to DIR as WAV+JSON "
-                             "for later review with other STT models.")
-    parser.add_argument("--wake", metavar="MODEL",
-                        help="Enable wake-word gating. MODEL is a pretrained "
-                             "name (hey_jarvis, ...) or a path to a custom "
-                             ".onnx (e.g. wake/models/billou.onnx). Requires "
-                             "openwakeword in the agent's venv.")
-    parser.add_argument("--wake-threshold", type=float, default=0.5,
-                        help="Wake-word detection threshold 0–1 (default 0.5).")
-    parser.add_argument("--conversation-timeout", type=float, default=6.0,
-                        help="Seconds to keep listening for a follow-up (no "
-                             "wake word needed) before going back to sleep "
-                             "(default 6).")
-    parser.add_argument("--motion", action="store_true",
-                        help="Connect to Reachy for movement/animations even "
-                             "with laptop audio (--no-robot). Hybrid mode: "
-                             "Mac mic+speaker, robot still wakes/sleeps/moves.")
-    parser.add_argument("--vad-threshold", type=float, default=0.02,
-                        help="Energy threshold for detecting speech after the "
-                             "wake word (default 0.02). RAISE it if Reachy "
-                             "never goes back to sleep (mic noise floor too "
-                             "high); lower it if it misses quiet speech.")
-    parser.add_argument("--min-voiced-ms", type=int, default=200,
-                        help="A capture needs at least this many ms of real "
-                             "sound (above the VAD threshold) to be sent to the "
-                             "LM (default 200). Filters clicks/coughs/faint "
-                             "noise so Reachy doesn't reply 'répète ?' to them.")
-    parser.add_argument("--no-tools", action="store_true",
-                        help="Disable tool calling (sleep, web search, emotes). "
-                             "Web search needs BRAVE_API_KEY in the env.")
-    parser.add_argument("--no-barge", action="store_true",
-                        help="Disable barge-in (interrupting Reachy while he "
-                             "speaks). With it on, talk over him to stop him.")
-    parser.add_argument("--barge-threshold", type=float, default=0.05,
-                        help="Echo-compensated energy needed to interrupt "
-                             "(default 0.05). Lower = easier to interrupt but "
-                             "more false stops; raise it if his own voice "
-                             "keeps stopping him (laptop mic near speaker).")
-    parser.add_argument("--barge-echo-gain", type=float, default=0.6,
-                        help="How much of his own voice to subtract from the "
-                             "mic when checking for interruption (0–1, default "
-                             "0.6). Higher if the speaker bleeds into the mic.")
-    parser.add_argument("--record-wake", metavar="DIR",
-                        help="Record wake-word events (detections, near-misses, "
-                             "and web-UI-flagged misses) to DIR as WAV+JSON, for "
-                             "labeling + retraining. See wake/label_recordings.py.")
-    parser.add_argument("--wake-verifier", metavar="JOBLIB",
-                        help="Custom verifier model (from wake/train_verifier.py) "
-                             "to filter out false detections using your own "
-                             "voice + false-trigger clips.")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--no-robot",
+        action="store_true",
+        help="Use laptop mic + speaker instead of Reachy.",
+    )
+    parser.add_argument(
+        "--metrics-log",
+        metavar="FILE",
+        default=None,
+        help="JSONL file for per-turn metrics (timings, tools, "
+        "texts). Default: logs/metrics.jsonl. Use --no-metrics "
+        "to disable.",
+    )
+    parser.add_argument(
+        "--no-metrics", action="store_true", help="Disable per-turn metrics logging."
+    )
+    parser.add_argument(
+        "--camera-index",
+        type=int,
+        default=None,
+        metavar="IDX",
+        help="Open the Reachy camera as a plain USB webcam (cv2) "
+        "for [tool:vision], decoupled from Reachy media/audio "
+        "so it works in laptop/--motion modes too. Try 0 "
+        "first. Without this, vision uses mini.media.get_frame() "
+        "which needs full Reachy media (not --motion/no_media).",
+    )
+    parser.add_argument(
+        "--output-device",
+        type=int,
+        default=None,
+        metavar="IDX",
+        help="sounddevice output index for TTS playback (laptop "
+        "mode). Default = system default. Use e.g. the "
+        "'Mac mini Speakers' index to avoid playing 44 kHz "
+        "TTS on a 16 kHz device. List with: python -c "
+        '"import sounddevice as sd; print(sd.query_devices())"',
+    )
+    parser.add_argument(
+        "--webui",
+        action="store_true",
+        help="Open a small web UI showing mic level, "
+        "transcripts, controls, and a type-to-speak box.",
+    )
+    parser.add_argument(
+        "--webui-port",
+        type=int,
+        default=8765,
+        help="Port for the web UI (default 8765).",
+    )
+    parser.add_argument(
+        "--save-audio",
+        metavar="DIR",
+        help="Save every captured utterance to DIR as WAV+JSON "
+        "(transcript, reply, timings) for later review.",
+    )
+    parser.add_argument(
+        "--wake",
+        metavar="MODEL",
+        help="Enable wake-word gating. MODEL is a pretrained "
+        "name (hey_jarvis, ...) or a path to a custom "
+        ".onnx (e.g. wake/models/billou.onnx). Requires "
+        "openwakeword in the agent's venv.",
+    )
+    parser.add_argument(
+        "--wake-threshold",
+        type=float,
+        default=0.5,
+        help="Wake-word detection threshold 0–1 (default 0.5).",
+    )
+    parser.add_argument(
+        "--conversation-timeout",
+        type=float,
+        default=6.0,
+        help="Seconds to keep listening for a follow-up (no "
+        "wake word needed) before going back to sleep "
+        "(default 6).",
+    )
+    parser.add_argument(
+        "--motion",
+        action="store_true",
+        help="Connect to Reachy for movement/animations even "
+        "with laptop audio (--no-robot). Hybrid mode: "
+        "Mac mic+speaker, robot still wakes/sleeps/moves.",
+    )
+    parser.add_argument(
+        "--vad-threshold",
+        type=float,
+        default=0.02,
+        help="Energy threshold for detecting speech after the "
+        "wake word (default 0.02). RAISE it if Reachy "
+        "never goes back to sleep (mic noise floor too "
+        "high); lower it if it misses quiet speech.",
+    )
+    parser.add_argument(
+        "--min-voiced-ms",
+        type=int,
+        default=200,
+        help="A capture needs at least this many ms of real "
+        "sound (above the VAD threshold) to be sent to the "
+        "LM (default 200). Filters clicks/coughs/faint "
+        "noise so Reachy doesn't reply 'répète ?' to them.",
+    )
+    parser.add_argument(
+        "--no-tools",
+        action="store_true",
+        help="Disable tool calling (sleep, web search, vision, timer, "
+        "motions). Web search uses free DuckDuckGo, or Brave if BRAVE_API_KEY "
+        "is set.",
+    )
+    parser.add_argument(
+        "--no-barge",
+        action="store_true",
+        help="Disable barge-in (interrupting Reachy while he "
+        "speaks). With it on, talk over him to stop him.",
+    )
+    parser.add_argument(
+        "--barge-threshold",
+        type=float,
+        default=0.05,
+        help="Echo-compensated energy needed to interrupt "
+        "(default 0.05). Lower = easier to interrupt but "
+        "more false stops; raise it if his own voice "
+        "keeps stopping him (laptop mic near speaker).",
+    )
+    parser.add_argument(
+        "--barge-echo-gain",
+        type=float,
+        default=0.6,
+        help="How much of his own voice to subtract from the "
+        "mic when checking for interruption (0–1, default "
+        "0.6). Higher if the speaker bleeds into the mic.",
+    )
+    parser.add_argument(
+        "--record-wake",
+        metavar="DIR",
+        help="Record wake-word events (detections, near-misses, "
+        "and web-UI-flagged misses) to DIR as WAV+JSON, for "
+        "labeling + retraining. See wake/label_recordings.py.",
+    )
+    parser.add_argument(
+        "--wake-verifier",
+        metavar="JOBLIB",
+        help="Custom verifier model (from wake/train_verifier.py) "
+        "to filter out false detections using your own "
+        "voice + false-trigger clips.",
+    )
     args = parser.parse_args()
 
     save_dir = None
@@ -778,13 +996,25 @@ def main():
         record_wake_dir = Path(args.record_wake).expanduser().resolve()
         record_wake_dir.mkdir(parents=True, exist_ok=True)
 
-    run(use_robot=not args.no_robot, tts_engine=args.tts,
-        webui=args.webui, webui_port=args.webui_port,
+    metrics_path = None
+    if not args.no_metrics:
+        metrics_path = (
+            Path(args.metrics_log).expanduser().resolve()
+            if args.metrics_log
+            else HERE / "logs" / "metrics.jsonl"
+        )
+
+    run(
+        use_robot=not args.no_robot,
+        webui=args.webui,
+        webui_port=args.webui_port,
         save_audio_dir=save_dir,
-        wake_model=args.wake, wake_threshold=args.wake_threshold,
+        wake_model=args.wake,
+        wake_threshold=args.wake_threshold,
         wake_verifier=args.wake_verifier,
         conversation_timeout=args.conversation_timeout,
-        motion=args.motion, vad_threshold=args.vad_threshold,
+        motion=args.motion,
+        vad_threshold=args.vad_threshold,
         min_voiced_ms=args.min_voiced_ms,
         use_tools=not args.no_tools,
         barge_enabled=not args.no_barge,
@@ -792,7 +1022,9 @@ def main():
         barge_echo_gain=args.barge_echo_gain,
         record_wake_dir=record_wake_dir,
         output_device=args.output_device,
-        camera_index=args.camera_index)
+        camera_index=args.camera_index,
+        metrics_path=metrics_path,
+    )
 
 
 if __name__ == "__main__":

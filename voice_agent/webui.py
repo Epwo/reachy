@@ -19,13 +19,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Deque, Optional
+from typing import Callable, Deque, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse

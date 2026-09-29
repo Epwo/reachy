@@ -11,10 +11,9 @@ from __future__ import annotations
 
 import time
 from collections import deque
-from typing import Iterator
+from typing import Iterator, Optional
 
 import numpy as np
-import soundfile as sf
 
 
 SAMPLE_RATE = 16000        # what Whisper expects

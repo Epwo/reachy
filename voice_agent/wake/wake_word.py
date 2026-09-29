@@ -16,7 +16,7 @@ Usage:
     python wake_word.py --model hey_jarvis
 
     # Avec ton modèle custom une fois entraîné :
-    python wake_word.py --model models/bilou.onnx --threshold 0.5
+    python wake_word.py --model models/billou.onnx --threshold 0.5
 
     # Sauver les phrases captées après réveil :
     python wake_word.py --model hey_jarvis --save-dir /tmp/wake_captures
@@ -27,7 +27,6 @@ Entraîner "Bilou"/"Reachy" : voir wake/README.md (notebook Colab, ~1h).
 from __future__ import annotations
 
 import argparse
-import os
 import time
 from collections import deque
 from pathlib import Path
