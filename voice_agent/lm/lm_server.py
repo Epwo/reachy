@@ -19,6 +19,9 @@ Protocol (one JSON object per line, both directions):
     in:   {"command": "clear_history"}        (resets the conversation)
     out:  {"ok": true}
 
+    in:   {"command": "prepare", "extra_system": "..."}   (build prompt cache)
+    out:  {"ok": true}
+
     in:   {"command": "get_history"}
     out:  {"history": [...]}
 
@@ -27,6 +30,7 @@ On failure: {"reply": null, "error": "..."}
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 import traceback
@@ -50,7 +54,14 @@ def log(msg: str) -> None:
 
 
 def main():
-    lm = ChatLM()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--no-prompt-cache", action="store_true",
+                        help="Re-process the whole prompt every turn (slower; "
+                             "for comparison/debugging).")
+    args = parser.parse_args()
+
+    lm = ChatLM(prompt_cache=not args.no_prompt_cache)
+    log(f"prompt cache: {'off' if args.no_prompt_cache else 'on'}")
     log("loading model...")
     lm._ensure_loaded()
     log("warming up (compiles MLX kernels)...")
@@ -77,6 +88,11 @@ def main():
                 emit({"ok": True})
             elif cmd == "get_history":
                 emit({"history": lm.get_history()})
+            elif cmd == "prepare":
+                # Pre-build the system-prompt snapshot for the exact prompt the
+                # agent will send (persona + tool docs), so turn 1 is fast too.
+                lm.prepare(CHAT_SYSTEM_PROMPT, job.get("extra_system", ""))
+                emit({"ok": True})
             elif cmd == "respond_chat":
                 # Main turn: write a reply from the user's transcribed text
                 # (persona + tool docs). Tool lines are parsed by the agent.

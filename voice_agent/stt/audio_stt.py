@@ -1,16 +1,16 @@
-"""Speech-to-text on MLX, via Whisper.
+"""Speech-to-text on MLX: Whisper (default) or Parakeet.
 
-Wraps `mlx-whisper` (`mlx-community/whisper-large-v3-turbo`) so the robot can
-turn a recorded utterance into French text quickly on Apple Silicon. This is
-the first stage of the cascade pipeline (STT → LM → TTS): a purpose-built ASR
-transcribes the audio, then a text-only LM only has to *write* a reply rather
-than also *listen*. That keeps comprehension high while letting the LM stay
-small and fast.
+First stage of the cascade pipeline (STT → LM → TTS): a purpose-built ASR
+transcribes the audio, so the LM only has to *write* a reply.
 
-Importable on its own so you can A/B test ASR models:
+Two engines, same `transcribe()` interface (pick with `make_stt(name)`):
+    whisper   mlx-community/whisper-large-v3-turbo   ~0.8 s / phrase, 4.3 % WER*
+    parakeet  mlx-community/parakeet-tdt-0.6b-v3     ~0.14 s / phrase, 5.2 % WER*
+* on 12 synthetic noisy French clips — compare on your real voice with the
+  agent's `--stt` flag + stats.py before switching the default.
 
-    from audio_stt import WhisperSTT
-    stt = WhisperSTT()
+    from audio_stt import make_stt
+    stt = make_stt("parakeet")
     text = stt.transcribe("/tmp/recording.wav")
 """
 
@@ -70,6 +70,42 @@ class WhisperSTT:
             condition_on_previous_text=False,
         )
         return (result.get("text") or "").strip()
+
+
+PARAKEET_MODEL = "mlx-community/parakeet-tdt-0.6b-v3"
+# NVIDIA Parakeet TDT v3 (0.6B), 25 European languages incl. French, language
+# auto-detected. Non-autoregressive decoder → ~6x faster than Whisper turbo.
+
+
+class ParakeetSTT:
+    """Audio → text with parakeet-mlx. Loads the model on first use."""
+
+    def __init__(self, model_repo: str = PARAKEET_MODEL):
+        self.model_repo = model_repo
+        self._model = None
+
+    def _ensure_loaded(self) -> None:
+        if self._model is None:
+            from parakeet_mlx import from_pretrained
+            self._model = from_pretrained(self.model_repo)
+
+    def transcribe(self, audio: "str | np.ndarray", sample_rate: int = 16000) -> str:
+        """Same contract as WhisperSTT.transcribe. We skip parakeet's own file
+        loader (it needs ffmpeg) and feed it a 16 kHz array directly."""
+        self._ensure_loaded()
+        import mlx.core as mx
+        from parakeet_mlx.audio import get_logmel
+
+        samples = _load_mono_16k(audio, sample_rate)
+        mel = get_logmel(mx.array(samples), self._model.preprocessor_config)
+        return self._model.generate(mel)[0].text.strip()
+
+
+ENGINES = {"whisper": WhisperSTT, "parakeet": ParakeetSTT}
+
+
+def make_stt(engine: str = "whisper"):
+    return ENGINES[engine]()
 
 
 WHISPER_SR = 16000

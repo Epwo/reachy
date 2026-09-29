@@ -80,6 +80,22 @@ def main():
               f"{statistics.median(vals):>8.0f} {_pct(vals, 0.9):>8.0f} "
               f"{min(vals):>8.0f} {max(vals):>8.0f}  {unit}")
 
+    # Side-by-side per configuration (--stt / --no-lm-cache). Records written
+    # before these fields existed were Whisper without the LM cache.
+    groups: dict[str, list[dict]] = {}
+    for r in rows:
+        cache = "cache" if r.get("lm_cache", False) else "sans cache"
+        groups.setdefault(f"{r.get('stt_engine', 'whisper')} / {cache}", []).append(r)
+    if len(groups) > 1:
+        print(f"\n{'configuration':24s} {'tours':>5} {'STT méd':>8} {'LM méd':>8} "
+              f"{'total méd':>10}")
+        for name, rs in sorted(groups.items()):
+            def med(k):
+                v = [r[k] for r in rs if isinstance(r.get(k), (int, float))]
+                return statistics.median(v) if v else 0
+            print(f"{name:24s} {len(rs):>5} {med('stt_ms'):>7.0f}ms {med('lm_ms'):>7.0f}ms "
+                  f"{med('response_ms'):>9.0f}ms")
+
     # Tool usage + mode counts.
     tool_counts: dict[str, int] = {}
     n_vision = n_search = 0

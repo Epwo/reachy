@@ -1,15 +1,20 @@
 # Reachy voice agent — local French assistant on Apple Silicon
 
 ```
-"Billou" ─► openWakeWord ─► Whisper large-v3-turbo ─► Qwen3.5-4B (VLM) ─► Supertonic 3 ─► 🔊
- wake word    + verifier       speech → French text    reply + [tool:…]     text → speech
-                                  .venv_whisper           .venv_lm         .venv_supertonic
+"Billou" ─► openWakeWord ─► Whisper / Parakeet ─► Qwen3.5-4B (VLM) ─► Supertonic 3 ─► 🔊
+ wake word    + verifier     speech → French text   reply + [tool:…]     text → speech
+                                  .venv_stt             .venv_lm         .venv_supertonic
+                                0.8 s / 0.12 s           ~1.2 s              ~0.7 s
 ```
 
 Everything runs on-device on a Mac mini M4 (12 GB). `agent.py` keeps the three
 models loaded as long-lived subprocesses (one venv each, because their MLX pins
 conflict) and talks to them with JSON over pipes. Why these models and not
 others: see [MODELES_TESTES.md](MODELES_TESTES.md).
+
+The LM keeps a **snapshot of its system prompt** (persona + tool docs, ~960
+tokens) instead of re-reading it every turn: that's what brings a reply from
+~3.4 s down to ~1.2 s. `--no-lm-cache` turns it off for comparison.
 
 What Bilou can do:
 
@@ -39,9 +44,9 @@ uv venv .venv_supertonic --python 3.12
 uv pip install --python .venv_supertonic/bin/python -r requirements.txt
 .venv_supertonic/bin/python -c "import openwakeword; openwakeword.utils.download_models()"
 
-# STT worker (Whisper)
-uv venv .venv_whisper --python 3.12
-uv pip install --python .venv_whisper/bin/python -r stt/requirements.txt
+# STT worker (Whisper + Parakeet)
+uv venv .venv_stt --python 3.12
+uv pip install --python .venv_stt/bin/python -r stt/requirements.txt
 
 # Chat LM worker (Qwen3.5-4B VLM)
 uv venv .venv_lm --python 3.12
@@ -52,8 +57,8 @@ uv venv .venv_wake --python 3.13
 uv pip install --python .venv_wake/bin/python -r wake/requirements.txt
 ```
 
-Model weights download from Hugging Face on first launch (~1.5 GB Whisper,
-~2.9 GB Qwen3.5-4B, plus Supertonic). The first start takes a while; after
+Model weights download from Hugging Face on first launch (~1.5 GB Whisper or
+~1.2 GB Parakeet, ~2.9 GB Qwen3.5-4B, plus Supertonic). The first start takes a while; after
 that each worker loads and warms up in ~10–30 s.
 
 ## Run
@@ -84,6 +89,8 @@ or by hand:
 
 | Flag | Default | Use it when… |
 |---|---|---|
+| `--stt whisper\|parakeet` | whisper | Parakeet is ~6× faster (0.12 s vs 0.8 s); compare on your voice first (see Metrics) |
+| `--no-lm-cache` | cache on | comparing against the uncached LM, or debugging a weird reply |
 | `--wake-threshold` | 0.5 | it wakes on noise (raise) or misses you (lower) |
 | `--vad-threshold` | 0.02 | he never goes back to sleep (raise) or misses quiet speech (lower) |
 | `--conversation-timeout` | 6 | you want a longer/shorter follow-up window |
@@ -110,6 +117,17 @@ think (`lm_ms`, plus `lm2_ms` for the vision/search 2nd pass), to synthesize
 (`tts_ms`), the total latency before he starts talking (`response_ms`), and tool
 usage. The raw JSONL is easy to load in pandas for anything else.
 
+Each turn records which `--stt` engine and LM cache setting it ran with, and
+when the log mixes several, `stats.py` adds a side-by-side table. To compare
+Whisper and Parakeet on your own voice, talk for a while with each and read the
+table (plus the `heard` texts in the log for accuracy):
+
+```bash
+./launch.sh                    # a dozen turns with Whisper
+./launch.sh --stt parakeet     # the same with Parakeet
+.venv_supertonic/bin/python stats.py
+```
+
 ## Test a single stage
 
 ```bash
@@ -122,8 +140,8 @@ usage. The raw JSONL is easy to load in pandas for anything else.
 
 | Component | Approx. RAM |
 |---|---|
-| Qwen3.5-4B 4-bit (`.venv_lm`) | ~3 GB |
-| Whisper large-v3-turbo (`.venv_whisper`) | ~1.6 GB |
+| Qwen3.5-4B 4-bit + prompt cache (`.venv_lm`) | ~3.7 GB peak |
+| Whisper large-v3-turbo or Parakeet v3 (`.venv_stt`) | ~1.6 / ~1.2 GB |
 | Supertonic 3 + wake word (`.venv_supertonic`) | ~0.6 GB |
 | Python/MLX runtime, 3 processes | ~1.5 GB |
 | macOS + background apps | ~3–4 GB |
@@ -138,6 +156,10 @@ usage. The raw JSONL is easy to load in pandas for anything else.
 - **LM worker fails to import `transformers`** — `huggingface-hub` got
   downgraded by another install:
   `uv pip install --python .venv_lm/bin/python -U "huggingface-hub>=1.5.0,<2.0"`.
+- **A worker behaves as if it had the wrong package version** — workers are
+  started without the agent's `PYTHONPATH` (the gstreamer package in
+  `.venv_supertonic` sets it to its own site-packages). If you launch a worker
+  by hand from an activated `.venv_supertonic` shell, `unset PYTHONPATH` first.
 - **Barge-in on the Mac mic is approximate** — there's no real echo
   cancellation, only "mic level minus a fraction of his own level". Tune the
   barge flags, use Reachy's mic, or headphones.
@@ -155,7 +177,7 @@ voice_agent/
 ├── stats.py            metrics summary
 ├── launch.sh           my usual launch command
 ├── requirements.txt    main venv (.venv_supertonic)
-├── stt/                Whisper worker (.venv_whisper)
+├── stt/                Whisper / Parakeet worker (.venv_stt)
 ├── lm/                 chat-LM worker + REPL tester (.venv_lm)
 ├── tts/                Supertonic worker (.venv_supertonic)
 ├── wake/               wake-word models, verifier training, labeling tools

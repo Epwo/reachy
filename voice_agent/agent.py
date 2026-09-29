@@ -7,7 +7,7 @@ multi-second warmup.
 Cascade:
     Reachy or laptop mic
         → WakeGatedCapture / VADCapture   (wake word, utterances cut on silence)
-        → stt_server (Whisper, .venv_whisper)       → French text
+        → stt_server (Whisper/Parakeet, .venv_stt)  → French text
         → lm_server  (Qwen3.5-4B VLM, .venv_lm)     → reply (+ [tool:...] lines)
         → tts_server (Supertonic, .venv_supertonic) → WAV
         → speaker (Reachy or laptop), with barge-in
@@ -191,6 +191,11 @@ class Worker:
         # cwd = the script's own folder so it can import sibling modules
         # (e.g. lm_server.py imports chat_lm.py from the same lm/ dir).
         cmd = [str(py), script_path.name] + list(script_args or [])
+        # Don't leak our PYTHONPATH: the gstreamer package in .venv_supertonic
+        # sets it to that venv's site-packages at startup, which made every
+        # worker import (mismatched) packages from .venv_supertonic instead of
+        # its own venv.
+        env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONHOME")}
         self.proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -199,6 +204,7 @@ class Worker:
             text=True,
             bufsize=1,
             cwd=str(script_path.parent),
+            env=env,
         )
         self._await_ready()
 
@@ -264,6 +270,8 @@ def run(
     output_device: Optional[int] = None,
     camera_index: Optional[int] = None,
     metrics_path: Optional[Path] = None,
+    stt_engine: str = "whisper",
+    lm_cache: bool = True,
 ):
     # We connect to the robot if we use it for audio (ReachyBackend) OR just
     # for movement/animation (--motion with laptop audio = hybrid mode).
@@ -293,8 +301,18 @@ def run(
 
     # Workers — these take 10-30 s to start as each loads + warms its model.
     # Cascade pipeline: STT (Whisper) → LM (Qwen3.5-4B) → TTS (Supertonic).
-    stt = Worker(HERE / ".venv_whisper", HERE / "stt" / "stt_server.py", "stt")
-    lm = Worker(HERE / ".venv_lm", HERE / "lm" / "lm_server.py", "lm")
+    stt = Worker(
+        HERE / ".venv_stt",
+        HERE / "stt" / "stt_server.py",
+        "stt",
+        script_args=["--engine", stt_engine],
+    )
+    lm = Worker(
+        HERE / ".venv_lm",
+        HERE / "lm" / "lm_server.py",
+        "lm",
+        script_args=[] if lm_cache else ["--no-prompt-cache"],
+    )
     tts = Worker(HERE / ".venv_supertonic", HERE / "tts" / "tts_server.py", "tts")
 
     # Optional web UI — starts a FastAPI server in a daemon thread that
@@ -529,6 +547,13 @@ def run(
     # Tools: docs appended to the system prompt + a context dict tools receive.
     tools_extra = toolkit.tools_system_prompt() if use_tools else ""
     tool_ctx = {"mini": mini, "capture": capture, "hybrid": hybrid}
+
+    # Prefill the exact system prompt (persona + tool docs) now, so the first
+    # turn already benefits from the LM prompt cache.
+    if lm_cache:
+        t0 = time.monotonic()
+        lm.call({"command": "prepare", "extra_system": tools_extra})
+        print(f"[lm] cache du prompt système prêt ({time.monotonic() - t0:.1f}s)")
     if use_tools:
         names = ", ".join(toolkit.TOOLS.keys())
         print(f"[tools] activés: {names}")
@@ -718,7 +743,10 @@ def run(
                         vr = lm.call(
                             {
                                 "command": "respond_chat",
-                                "text": heard,
+                                # Otherwise the model, still seeing the vision
+                                # tool doc, just asks to look again.
+                                "text": f"{heard}\n(Image de ta caméra jointe : "
+                                "décris ce que tu vois, sans [tool:vision].)",
                                 "extra_system": tools_extra,
                                 "image_path": frame_path,
                             }
@@ -750,9 +778,10 @@ def run(
                         {"command": "respond_text", "text": "\n".join(followups)}
                     )
                     t_lm2 = time.monotonic() - t2
-                    answer = (
-                        fr.get("reply") if not fr.get("error") else None
-                    ) or "Désolé, je n'ai rien trouvé."
+                    raw_f = (fr.get("reply") if not fr.get("error") else None) or ""
+                    # Never speak tool lines the summary pass may imitate.
+                    _, answer = toolkit.parse_tool_calls(raw_f)
+                    answer = _clean_for_tts(answer) or "Désolé, je n'ai rien trouvé."
                     print(f"[reply+] {answer}")
                     t_tts_ms, audio_s = _play_text(answer)
                     final_reply = answer
@@ -788,7 +817,9 @@ def run(
                         "vision": want_vision,
                         "search": bool(followups),
                         "utterance_s": round(len(utterance) / 16000, 3),
-                        "stt_ms": stt_ms,  # temps de compréhension (Whisper)
+                        "stt_engine": stt_engine,
+                        "lm_cache": lm_cache,
+                        "stt_ms": stt_ms,  # temps de compréhension
                         "lm_ms": lm_ms,  # temps de génération (1er passage)
                         "lm2_ms": lm2_ms,  # 2e passage LM (vision/recherche)
                         "tts_ms": tts_ms,  # synthèse vocale
@@ -840,6 +871,19 @@ def main():
         "--no-robot",
         action="store_true",
         help="Use laptop mic + speaker instead of Reachy.",
+    )
+    parser.add_argument(
+        "--stt",
+        choices=["whisper", "parakeet"],
+        default="whisper",
+        help="Speech-to-text engine. parakeet is ~6x faster; compare both "
+        "on your voice with stats.py before switching (default whisper).",
+    )
+    parser.add_argument(
+        "--no-lm-cache",
+        action="store_true",
+        help="Disable the LM system-prompt cache (re-reads the ~1000-token "
+        "system prompt every turn, ~2 s slower). For comparison/debugging.",
     )
     parser.add_argument(
         "--metrics-log",
@@ -1024,6 +1068,8 @@ def main():
         output_device=args.output_device,
         camera_index=args.camera_index,
         metrics_path=metrics_path,
+        stt_engine=args.stt,
+        lm_cache=not args.no_lm_cache,
     )
 
 

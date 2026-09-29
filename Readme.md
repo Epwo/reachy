@@ -22,7 +22,7 @@ Details: [`face_track/readme.md`](face_track/readme.md).
 ## `voice_agent/` — "Billou", the voice assistant
 
 ```
-"Billou" → openWakeWord → Whisper large-v3-turbo → Qwen3.5-4B (VLM) → Supertonic 3 → 🔊
+"Billou" → openWakeWord → Whisper or Parakeet → Qwen3.5-4B (VLM) → Supertonic 3 → 🔊
 ```
 
 ```bash
@@ -47,7 +47,7 @@ why these models: [`voice_agent/MODELES_TESTES.md`](voice_agent/MODELES_TESTES.m
 reachy/
 ├── face_track/          face tracking + recognition   (.venv_reachy)
 └── voice_agent/         voice assistant
-    ├── stt/             speech → text, Whisper        (.venv_whisper)
+    ├── stt/             speech → text, Whisper/Parakeet (.venv_stt)
     ├── lm/              text/image → reply, Qwen3.5   (.venv_lm)
     ├── tts/             text → speech, Supertonic     (.venv_supertonic, also runs agent.py)
     └── wake/            wake-word models + training   (.venv_wake)

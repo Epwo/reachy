@@ -6,7 +6,7 @@
 # and describe what its camera sees. Newer mlx is required, incompatible with
 # the moshi_mlx pin used by the Kyutai TTS step, so they live in separate envs.
 
-mlx-vlm>=0.6.3          # 0.6.3+ handles the Qwen3.5 MoE conversion
+mlx-vlm>=0.7.4          # PromptCacheState, used for the system-prompt snapshot
 
 # Pin to avoid a recurring downgrade: transformers (pulled by mlx-vlm) needs
 # huggingface-hub>=1.5; other deps sometimes drag it back to 1.3.x which breaks

@@ -141,13 +141,26 @@ dans leur propre architecture "speech-to-speech assistant".
   sous-titres (« Sous-titrage ST' 501 ») — sans conséquence, la VAD n'envoie
   que de la vraie parole.
 
+### Parakeet TDT 0.6B v3 (mlx-community/parakeet-tdt-0.6b-v3) — option `--stt parakeet` (sept. 2026)
+
+- **Modalités** : ASR NVIDIA, 25 langues européennes dont le français, langue
+  détectée automatiquement ; port MLX `parakeet-mlx`. Décodeur non
+  autorégressif → très rapide.
+- **Mesures** (12 phrases françaises synthétiques bruitées, 2 voix) :
+  **0.12 s** par phrase contre 0.82 s pour Whisper, WER 5.2 % contre 4.3 %
+  (une seule vraie faute en plus : « pattes » pour « pâtes »).
+- **Statut** : option, Whisper reste par défaut en attendant une comparaison
+  sur la vraie voix d'Ewann au micro de Reachy (`stats.py` compare les deux).
+- **Piège** : comme Whisper, son chargeur de fichiers exige ffmpeg → on lui
+  donne directement un tableau 16 kHz.
+
 ### Autres ASR évalués (juin 2026, sur papier)
 
 | Modèle | Verdict |
 |---|---|
 | Voxtral Small 24B | ~14 Go même en 4-bit → ne tient pas en 12 Go |
 | Voxtral Mini 3B | très bon français, ports MLX communautaires — meilleure alternative si Whisper déçoit |
-| Nemotron / Parakeet / Canary (« 80 ms ») | écosystème NVIDIA NeMo/CUDA, Parakeet anglais seulement |
+| Nemotron / Canary (« 80 ms ») | écosystème NVIDIA NeMo/CUDA. (Parakeet v3, lui, est multilingue et a un port MLX : voir ci-dessus — j'avais tort en juin.) |
 | Qwen3-ASR | surtout une API (Alibaba), pas de poids MLX locaux mûrs |
 | SenseVoice-Small (FunAudioLLM) | ultra rapide (non autorégressif) mais PyTorch/ONNX, pas MLX ; français un cran sous Whisper |
 | Qwen2.5-Omni 7B | audio-LLM trop gros et orienté EN/ZH |
@@ -231,9 +244,32 @@ Depuis la cascade, le LM n'a plus qu'à *écrire* 1–2 phrases (et des lignes
 - Raisonnement (`<think>`) **désactivé par défaut** sur le 4B — indispensable
   pour la latence ; on passe quand même `enable_thinking=False` et on retire
   tout bloc `<think>` par sécurité.
-- **Mesures** : ~2.6 s en test isolé, ~6.8 s avec une image ; **médiane 4.3 s en
-  usage réel** (prompt système + doc des outils + historique). C'est l'étape
-  la plus lente du pipeline.
+- **Mesures (juin)** : ~2.6 s en test isolé, ~6.8 s avec une image ; **médiane
+  4.3 s en usage réel** (prompt système + doc des outils + historique).
+
+### Accélérer le même modèle (benchmark sept. 2026) ⭐
+
+Benchmark sur une vraie conversation de 8 tours (prompt système réel + doc des
+outils), mlx-vlm 0.7.4 :
+
+| Config | Temps / réponse | Verdict |
+|---|---|---|
+| 4B tel quel | 3.43 s | ~2.7 s passées à relire les ~1100 tokens de prompt à ~420 tok/s |
+| 4B + `PromptCacheState` de mlx-vlm | 3.45 s | aucun effet (voir ci-dessous) |
+| **4B + snapshot du prompt système** | **1.17 s** | ⭐ **retenu** — même qualité, moins de mémoire (3.7 vs 4.2 Go) |
+| + décodage spéculatif MTP (`Qwen3.5-4B-MTP-4bit`) | 1.25 s | pas de gain : réponses trop courtes (20–40 tokens) |
+| + décodage spéculatif DFlash (`z-lab/Qwen3.5-4B-DFlash`) | 1.67 s | plus lent, +2 Go |
+| Qwen3.5-2B + snapshot | 0.98 s | ❌ mauvais outils, météo inventée, boucle sur la même phrase |
+
+- **Pourquoi le cache standard ne marche pas** : Qwen3.5 est hybride — 3 couches
+  sur 4 sont du Gated DeltaNet (attention linéaire) avec un état récurrent qu'on
+  ne peut pas « rembobiner ». mlx-vlm ne réutilise le cache que si le nouveau
+  prompt prolonge *exactement* les tokens en cache ; sinon il recalcule tout
+  sans rien dire.
+- **La solution** : pré-remplir une fois le prompt système (persona + outils,
+  ~960 tokens), garder cet état, et en restaurer une copie à chaque tour.
+- **Conséquence** : l'heure ne peut plus être dans le prompt système (il
+  changerait chaque minute) → étiquette `[heure : …]` à la fin de chaque message.
 
 ### Autres candidats écartés
 
@@ -244,6 +280,17 @@ Depuis la cascade, le LM n'a plus qu'à *écrire* 1–2 phrases (et des lignes
 | Gemma 3 4B | VLM aussi, rien de mieux que Qwen3.5 pour nous |
 | Llama 3.1 8B | bon français mais 2× plus lent, connaissances 2023 |
 | SmolLM3 3B | orienté anglais |
+| Qwen3.5-2B | testé (tableau ci-dessus) : trop bête pour les outils |
+| K2 Horizon 3.7B (IFM, sept. 2026) | texte seul (perd la vision), cartes centrées anglais, MLX communautaire 4.1 Go |
+| Qwen 3.6 / 3.7 / 3.8 | seulement en 27B et plus |
+| Qwen3.8-Flash-Next | 125B (+51B d'embeddings), ~70 Go en 4-bit — aperçu de l'archi Qwen4, à surveiller en petites tailles |
+| GLM-5.3-Flash | 320B au total (18B actifs) |
+| DeepSeek V4.1 Flash | 552B au total (8–16B actifs) |
+
+> **Règle pour les MoE** : seuls quelques experts *calculent* par token, mais
+> **tous doivent tenir en mémoire**. Sur 12 Go partagés avec STT + TTS, le
+> plafond est ~6–8B de paramètres *au total* en 4-bit. « Flash » = pas cher par
+> token sur un serveur, pas petit.
 
 ---
 
@@ -331,25 +378,29 @@ Depuis la cascade, le LM n'a plus qu'à *écrire* 1–2 phrases (et des lignes
 
 ```
 mot de réveil (openWakeWord + verifier)
-  → Whisper large-v3-turbo  (parole → texte, .venv_whisper)   ~0.8 s
-  → Qwen3.5-4B VLM          (texte/image → réponse, .venv_lm) ~4.3 s
+  → Whisper large-v3-turbo  (parole → texte, .venv_stt)        ~0.8 s
+     ou Parakeet v3 (--stt parakeet)                            ~0.12 s
+  → Qwen3.5-4B VLM + snapshot du prompt système (.venv_lm)      ~1.2 s
   → Supertonic 3            (texte → parole, .venv_supertonic) ~0.7 s
   → haut-parleur
 ```
 
-Latence médiane avant que Bilou parle : **~6 s** (mesurée par `stats.py`).
+Latence avant que Bilou parle : **~6 s en juin → ~2.7 s avec Whisper, ~2 s
+avec Parakeet** (estimation à partir des benchmarks ; à confirmer par `stats.py`).
 
 **Pourquoi ce choix** :
-- Whisper = transcription française fiable et rapide, indépendante du LM
-- Qwen3.5-4B = bon français + vision + outils, sans raisonnement coûteux
+- Whisper = transcription française fiable, indépendante du LM ; Parakeet en
+  option pour la vitesse
+- Qwen3.5-4B = bon français + vision + outils, sans raisonnement coûteux ;
+  aucun modèle plus récent n'est à la fois plus malin et assez petit
 - Supertonic 3 = bonne voix, sub-realtime, ONNX (aucun conflit MLX)
 
 ## Voies futures à explorer
 
 | Idée | Pourquoi |
 |---|---|
-| Streamer la réponse du LM phrase par phrase vers le TTS | le LM est l'étape la plus lente ; sans `[heard]` la cascade n'a plus le problème qui avait fait échouer le streaming avec Gemma |
-| Essayer Qwen3.5-2B pour le chat | si 4.3 s reste trop long et que la qualité suit |
+| Streamer la réponse du LM phrase par phrase vers le TTS | Bilou commencerait à parler dès la 1re phrase ; sans `[heard]` la cascade n'a plus le problème qui avait fait échouer le streaming avec Gemma |
+| Petits modèles Qwen4 quand ils sortiront | Qwen3.8-Flash-Next en préfigure l'architecture ; à re-benchmarker avec `bench_lm` |
 | Voxtral Mini 3B à la place de Whisper | si la transcription française déçoit |
 | Si M4 Pro / Max disponible | Moshi-MLX pour le naturel du full-duplex |
 | Si un omni-modèle français tient en 12 Go en MLX | remplacer toute la cascade par un seul modèle |
